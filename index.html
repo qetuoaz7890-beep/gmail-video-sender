@@ -1,6 +1,6 @@
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>影片寄送工作台 V4.4.2</title><style>
+<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>影片寄送工作台 V4.4.3</title><style>
 :root{font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;color:#eaf0ff;background:#0b1220}*{box-sizing:border-box}body{margin:0;padding:14px}main{max-width:850px;margin:auto}h1{font-size:1.5rem;margin:8px 0}.muted{color:#b2c0d8;font-size:.91rem}.panel{background:#17243a;border:1px solid #344862;border-radius:15px;padding:16px;margin:13px 0}label{display:block;font-weight:650;margin:12px 0 6px}input{width:100%;padding:11px;background:#0d192d;color:#fff;border:1px solid #536683;border-radius:9px;font-size:16px}input[type=file]{padding:8px}button{border:0;border-radius:9px;padding:12px 14px;font-weight:700;background:#64b6ff;color:#071426;margin:6px 6px 6px 0;cursor:pointer}button.secondary{background:#344963;color:#fff}button.warn{background:#ffce74}button:disabled{opacity:.45;cursor:not-allowed}.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.stat{background:#0d192d;border-radius:10px;padding:12px}.stat b{display:block;font-size:1.2rem;margin-top:4px}progress{width:100%;height:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;font-size:12px;background:#091426;padding:12px;border-radius:9px}.notice{color:#ffdc95}small{color:#a9b9d3}@media(min-width:700px){.stats{grid-template-columns:repeat(4,1fr)}}
-</style></head><body><main><h1>📨 影片寄送工作台 V4.4.2</h1><div class="muted">手機優先｜Gmail 附件寄送｜19MB 分割｜安全容量控管</div>
+</style></head><body><main><h1>📨 影片寄送工作台 V4.4.3</h1><div class="muted">手機優先｜Gmail 附件寄送｜19MB 分割｜安全容量控管</div>
 <section class="panel"><h2>① Gmail 設定</h2><label>Google OAuth 用戶端 ID</label><input id="clientId" placeholder="xxxx.apps.googleusercontent.com" autocomplete="off"><small>Google Cloud OAuth 網頁用戶端 ID；GitHub Pages 網址須列為已授權 JavaScript 來源。</small><label>收件人 Email</label><input id="recipient" type="email" placeholder="name@company.com"><label>信件主旨前綴</label><input id="subject" value="影片附件"><button id="login">連結 Gmail</button><button class="secondary" id="logout">中斷連線</button><div id="authState" class="muted">尚未連線</div></section>
 <section class="panel"><h2>② 選擇影片</h2><label>可一次多選，最多 130 部</label><input id="files" type="file" accept="video/*" multiple><small>每封一段影片，單段上限 19MiB。較大的影片會在本機嘗試免重新編碼分割；受關鍵影格、格式及手機記憶體限制，並非每部影片都能成功。</small><label>本輪郵件容量預算（MiB，含編碼估算）</label><input id="budget" type="number" min="50" max="900" value="700"><small>預設 700MiB，包含 Base64/MIME 開銷估算，為約 1GB Outlook 信箱保留空間。無法查詢 Outlook 實際剩餘容量，亦無法保證剛好在 1GB 停止。若清空信箱後開新一輪，請先重新整理。</small><div class="stats"><div class="stat">影片數<b id="fileCount">0</b></div><div class="stat">待寄附件<b id="pending">0</b></div><div class="stat">已寄附件<b id="sent">0 MiB</b></div><div class="stat">預算餘額<b id="remaining">700 MiB</b></div></div></section>
 <section class="panel"><h2>③ 分割與寄送</h2><button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="prepare">準備影片 / 自動分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試失敗項目</button><progress id="progress" max="100" value="0"></progress><div id="status" class="notice">請先檢查 FFmpeg 核心，再選擇影片。</div><p class="muted">寄送時請保持分頁開啟；重新整理會清除未寄送佇列。暫停後可在同一頁繼續。失敗重試前，請先檢查 Gmail 已寄件匣，以免網路中斷造成重複寄送。</p></section>
@@ -18,7 +18,35 @@ function usedWire(){return items.filter(x=>x.state==='sent'||x.state==='sending'
 function refresh(){const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=(items.filter(x=>x.state==='sent').reduce((n,x)=>n+x.blob.size,0)/MB).toFixed(1)+' MiB';$('remaining').textContent=(Math.max(0,budgetBytes()-usedWire())/MB).toFixed(1)+' MiB';$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${(x.blob.size/MB).toFixed(2)}MiB — ${x.state}${x.error?' ('+x.error+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=items.length?Math.round(items.filter(x=>x.state==='sent').length/items.length*100):0}
 $('files').addEventListener('change',()=>{if(running){status('處理中請勿更換影片');return}items=[];prepared=false;refresh();status(`已選取 ${$('files').files.length} 部影片`)});$('budget').addEventListener('change',refresh);
 function loadScript(src){return new Promise((resolve,reject)=>{const s=document.createElement('script');s.src=src;s.async=true;s.onload=resolve;s.onerror=()=>reject(Error('Google 登入元件載入失敗'));document.head.appendChild(s)})}
-$('login').onclick=async()=>{try{const id=$('clientId').value.trim();if(!id.endsWith('.apps.googleusercontent.com'))throw Error('請輸入正確 OAuth 用戶端 ID');if(!window.google?.accounts?.oauth2)await loadScript('https://accounts.google.com/gsi/client');tokenClient=google.accounts.oauth2.initTokenClient({client_id:id,scope:GMAIL_SCOPE,callback:r=>{if(r.error){status('Gmail 授權失敗：'+r.error);return}token=r.access_token;$('authState').textContent='Gmail 已授權（此分頁有效）';status('Gmail 已連線')}});tokenClient.requestAccessToken({prompt:'consent'})}catch(e){status(e.message)}};
+// Load Google Identity Services before a user clicks, preserving popup gesture.
+let gisReady=false, gisError='';
+const gisScript=document.createElement('script');
+gisScript.src='https://accounts.google.com/gsi/client';
+gisScript.async=true;
+gisScript.onload=()=>{gisReady=!!window.google?.accounts?.oauth2;log(gisReady?'Google 登入元件已就緒':'Google 登入元件未初始化')};
+gisScript.onerror=()=>{gisError='Google 登入元件下載失敗，請檢查網路或內容封鎖';status(gisError)};
+document.head.appendChild(gisScript);
+$('login').onclick=()=>{
+  try{
+    const id=$('clientId').value.trim();
+    if(!id.endsWith('.apps.googleusercontent.com'))throw Error('請先輸入正確的 OAuth 用戶端 ID');
+    if(!gisReady||!window.google?.accounts?.oauth2)throw Error(gisError||'Google 登入元件尚未就緒，請稍候 5 秒再按一次');
+    tokenClient=google.accounts.oauth2.initTokenClient({
+      client_id:id,scope:GMAIL_SCOPE,
+      callback:r=>{
+        if(r.error){status('Gmail 授權失敗：'+r.error+(r.error_description?' / '+r.error_description:''));return}
+        if(!r.access_token){status('Google 沒有回傳授權憑證');return}
+        token=r.access_token;
+        $('authState').textContent='Gmail 已授權（此分頁有效）';
+        status('Gmail 已連線');
+      },
+      error_callback:e=>status('Google 登入視窗錯誤：'+(e.type||'unknown')+'。請檢查 Chrome 彈出式視窗設定')
+    });
+    status('正在開啟 Google 授權視窗…');
+    // Must run synchronously within the original click handler.
+    tokenClient.requestAccessToken({prompt:'consent'});
+  }catch(e){status('Gmail 登入無法啟動：'+e.message)}
+};
 $('logout').onclick=()=>{if(token&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(token,()=>{});token='';$('authState').textContent='尚未連線';status('已中斷 Gmail 連線')};
 async function loadFFmpeg(){
   if(ffmpeg)return ffmpeg;
@@ -57,7 +85,7 @@ async function loadFFmpeg(){
     }catch(e){try{engine.terminate()}catch(_){}throw e}
     finally{clearTimeout(timer);URL.revokeObjectURL(workerUrl)}
     ffmpeg={engine,util};
-    status('FFmpeg 核心載入成功（V4.4.2）');
+    status('FFmpeg 核心載入成功（V4.4.3）');
     return ffmpeg;
   })();
   try{return await loadingFFmpeg}
@@ -74,6 +102,6 @@ function b64urlBytes(bytes){let s='';for(let i=0;i<bytes.length;i+=32768)s+=Stri
 async function sendOne(item,index){const boundary='v441_'+Date.now()+'_'+index,email=$('recipient').value.trim(),subject=($('subject').value.trim()||'影片附件')+` ${index+1}/${items.length}`,filename=item.name.replace(/[\r\n"\\]/g,'_');const header=`To: ${email}\r\nSubject: =?UTF-8?B?${b64utf8(subject)}?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64utf8('影片附件：'+filename)}\r\n--${boundary}\r\nContent-Type: ${item.blob.type||'application/octet-stream'}; name="attachment"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;const bytes=new Uint8Array(await item.blob.arrayBuffer());let attachment='';for(let i=0;i<bytes.length;i+=3*8192){const part=bytes.subarray(i,i+3*8192);let binary='';for(let j=0;j<part.length;j++)binary+=String.fromCharCode(part[j]);attachment+=btoa(binary)}const raw=b64urlBytes(new TextEncoder().encode(header+attachment+`\r\n--${boundary}--\r\n`));const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({raw})});if(!res.ok){const detail=await res.text();if(res.status===401)token='';throw Error(`Gmail HTTP ${res.status}: ${detail.slice(0,240)}`)}return await res.json()}
 async function sendQueue(failedOnly=false){if(running)return;running=true;stopRequested=false;try{if(!prepared)throw Error('請先完成影片準備');if(!token)throw Error('請先連結 Gmail');if(!$('recipient').checkValidity()||!$('recipient').value.trim())throw Error('請輸入正確收件信箱');const targets=items.filter(x=>failedOnly?x.state==='failed':x.state==='ready'||x.state==='failed');if(!targets.length)throw Error('沒有可寄送附件');for(const x of targets){if(stopRequested){status('已暫停，未寄出項目保留');break}if(usedWire()+estimatedWire(x.blob.size)>budgetBytes()){status('已達安全容量預算，停止寄送；請確認 Outlook 容量');break}x.state='sending';refresh();const idx=items.indexOf(x);status(`寄送第 ${idx+1}/${items.length} 段：${x.name}`);try{const result=await sendOne(x,idx);x.state='sent';x.gmailId=result.id||'';x.error='';log('寄送成功：'+x.name+' / Gmail ID: '+x.gmailId)}catch(e){x.error=e.message;const ambiguous=/Failed to fetch|NetworkError|network|timeout|abort/i.test(e.message);x.state=ambiguous?'uncertain':'failed';status('寄送異常：'+x.name+' — '+e.message);if(ambiguous){status('網路結果不明：請先查 Gmail 已寄件匣，不要直接重試，以免重複寄送');break}if(!token||/429|403/.test(e.message)){status('Gmail 授權或額度問題，已停止');break}}refresh();await sleep(1000)}status('本輪處理結束；已確認成功 '+items.filter(x=>x.state==='sent').length+' / '+items.length+' 段')}catch(e){status(e.message)}finally{running=false;refresh()}}
 $('send').onclick=()=>sendQueue(false);$('retry').onclick=()=>sendQueue(true);
-$('export').onclick=()=>{const content='Gmail V4.4.2 寄送紀錄\n'+new Date().toLocaleString('zh-TW')+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v442-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
+$('export').onclick=()=>{const content='Gmail V4.4.3 寄送紀錄\n'+new Date().toLocaleString('zh-TW')+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v443-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
 $('clientId').value=localStorage.getItem('v44_clientId')||'';$('recipient').value=localStorage.getItem('v44_recipient')||'';for(const id of ['clientId','recipient'])$(id).addEventListener('change',()=>localStorage.setItem('v44_'+id,$(id).value));refresh();
 </script></body></html>
