@@ -151,14 +151,8 @@
       <label for="subject">信件主旨前綴</label>
       <input id="subject" value="影片附件">
       <div class="row stack">
-        <button type="button" id="prepareOnly" class="secondary" disabled>先看封數與總容量</button>
         <button type="button" id="testCore" class="secondary" disabled>檢查 FFmpeg 核心</button>
         <button type="button" id="logout" class="secondary" hidden>中斷 Gmail 連線</button>
-      </div>
-      <div id="preparedPreview" hidden>
-        <label for="preparedAttachment">選擇已準備的附件</label>
-        <select id="preparedAttachment"></select>
-        <button type="button" id="downloadPrepared" class="secondary stack">下載選取的附件</button>
       </div>
     </details>
   </section>
@@ -169,23 +163,29 @@
       <input id="files" type="file" accept="video/*" multiple
              aria-label="選擇或加選影片" aria-describedby="fileCount">
       <p id="fileCount" class="muted">已選 0／130 部</p>
-      <ul id="fileList" hidden></ul>
     </fieldset>
-    <p class="muted">超過 19 MiB 自動分割。每封一段，附件從 0001 依序命名。</p>
+    <p class="muted">19 MiB 以內使用原檔，超過上限會分割。每封一段，附件從 0001 依序命名。</p>
     <label for="clipQuality">分割畫質</label>
     <select id="clipQuality" aria-describedby="clipQualityHelp">
       <option value="standard">標準（剪輯較快）</option>
       <option value="detail">高畫質（保留更多細節）</option>
     </select>
     <p class="muted" id="clipQualityHelp">套用到接下來分割的影片。高畫質可能增加剪輯時間和附件大小。</p>
+    <button type="button" id="prepareOnly" class="stack" aria-describedby="status" disabled>開始剪輯</button>
+    <p id="status" class="notice" role="status">工具尚未啟動。若重新整理後仍顯示此訊息，請重新上傳完整的 index.html。</p>
+    <div id="preparedPreview" hidden>
+      <label for="preparedAttachment">選擇已準備的附件</label>
+      <select id="preparedAttachment"></select>
+      <button type="button" id="downloadPrepared" class="secondary stack">下載選取的附件</button>
+    </div>
     <p id="scheduleHint" class="muted" hidden>展開每部影片的「剪輯／發送設定」可手動開始或排程。延後分鐘從啟動批次起算。</p>
+    <ul id="fileList" hidden></ul>
   </section>
 
   <section class="panel" aria-labelledby="sendHeading">
     <h2 id="sendHeading">發送</h2>
     <div id="progressText">尚未開始</div>
     <progress id="progress" max="100" value="0" aria-label="本批處理進度"></progress>
-    <p id="status" class="notice" role="status">工具尚未啟動。若重新整理後仍顯示此訊息，請重新上傳完整的 index.html。</p>
     <p id="scheduleInfo" class="muted recipient" hidden></p>
     <p id="scheduleKeepOpen" class="muted" hidden>請將此分頁留在前景。關閉或重新整理會清除排程。</p>
     <p id="sentSize" class="muted" hidden></p>
@@ -242,6 +242,7 @@ let gisReady = false;
 let gisError = '';
 let ffmpeg = null;
 let loadingFFmpeg = null;
+let clipPausedByCore = false;
 let sources = [];
 let items = [];
 let previewAttachments = [];
@@ -316,6 +317,7 @@ function render() {
   $('logout').disabled = authPending || !!activeUploads.size;
   $('testCore').disabled = diagnosing || previewing || !!activeClip;
   $('prepareOnly').disabled = !canChooseFiles || !sources.some(source => source.clip.mode === 'auto');
+  $('prepareOnly').textContent = previewing ? '剪輯中…' : '開始剪輯';
   $('preparedPreview').hidden = !previewAttachments.length;
   $('recipient').disabled = !!batch?.email;
   $('subject').disabled = !!batch?.email;
@@ -614,7 +616,7 @@ fileInput.onchange = () => {
     sources.push({file, clip: newPlan(), send: newPlan(), parts: null, items: null, problem: '', controls: null});
   }
   renderFiles();
-  status(`已選 ${sources.length} 部影片。`);
+  status(`已選 ${sources.length} 部影片。點「開始剪輯」可先準備附件。`);
   advanceSchedule();
 };
 
@@ -688,6 +690,7 @@ $('testCore').onclick = async () => {
   render();
   try {
     await loadFFmpeg();
+    clipPausedByCore = false;
     status('FFmpeg 核心可用。');
   } catch (error) {
     log('核心診斷：' + errorMessage(error));
@@ -711,6 +714,7 @@ async function prepareSource(source) {
   } catch (error) {
     source.parts = null;
     if (stopRequested) return;
+    if (error.coreUnavailable) clipPausedByCore = true;
     source.problem = errorMessage(error);
     log(`準備失敗：${file.name} — ${source.problem}`);
   }
@@ -1077,7 +1081,9 @@ function planTime(plan, anchor) {
 function nextStage(kind) {
   let next = null;
   for (const source of sources) {
-    if (kind === 'clip' ? clipDone(source) || source.problem : source === activeClip || !sourceCanSend(source)) continue;
+    if (kind === 'clip') {
+      if (clipDone(source) || source.problem || (clipPausedByCore && source.file.size > MAX)) continue;
+    } else if (source === activeClip || !sourceCanSend(source)) continue;
     const plan = source[kind];
     const requested = plan.requestedAt !== null;
     let at = plan.requestedAt;
@@ -1172,9 +1178,10 @@ async function runClip(source) {
     await prepareSource(source);
     if (source.parts) {
       updatePreparedPreview();
-      status(`${source.file.name} 剪輯完成，共 ${source.parts.length} 段。`);
+      status(source.file.size <= MAX ? `${source.file.name} 原檔已準備。`
+        : `${source.file.name} 剪輯完成，共 ${source.parts.length} 段。`);
     } else if (source.problem) {
-      status(`${source.file.name} 剪輯失敗，可重試這部影片。`);
+      status(`${source.file.name} 剪輯失敗：${source.problem}`);
     }
   } finally {
     activeClip = null;
@@ -1200,6 +1207,7 @@ function requestStage(source, kind) {
   if (stopping()) return;
   if (kind === 'clip') {
     if (stageLocked(source, kind)) return;
+    clipPausedByCore = false;
     source.problem = '';
   } else if (!sourceCanSend(source) || source === activeClip || sourceSending(source) || hasUncertain()) {
     return;
@@ -1285,6 +1293,7 @@ function resendUncertain(item) {
 function startBatch() {
   if (!sources.length || stopping() || previewing) return;
   stopRequested = false;
+  clipPausedByCore = false;
   batch ||= newBatch();
   batch.startedAt ??= Date.now();
   batch.armed = true;
@@ -1296,21 +1305,26 @@ function startBatch() {
 async function preparePreview() {
   if (batch || previewing || diagnosing || activeClip) return;
   stopRequested = false;
+  clipPausedByCore = false;
   previewing = true;
   render();
+  let failedSource = null;
   try {
     for (const source of sources) {
       if (stopRequested) break;
       if (source.clip.mode !== 'auto' || clipDone(source)) continue;
+      if (clipPausedByCore && source.file.size > MAX) continue;
       activeClip = source;
       updateScreenLock();
       render();
       await prepareSource(source);
+      if (source.problem) failedSource ??= source;
       activeClip = null;
     }
     updatePreparedPreview();
     const bytes = previewAttachments.reduce((total, item) => total + item.size, 0);
     if (stopRequested) status('已暫停剪輯。完成的片段仍可下載。');
+    else if (failedSource) status(`已準備 ${previewAttachments.length} 個附件。${failedSource.file.name} 剪輯失敗：${failedSource.problem}`);
     else status(`已準備 ${previewAttachments.length} 個附件，共 ${(bytes / MB).toFixed(1)} MiB。`);
   } finally {
     activeClip = null;
@@ -1355,6 +1369,7 @@ $('retry').onclick = () => {
 $('retrySources').onclick = () => {
   if (stopping()) return;
   stopRequested = false;
+  clipPausedByCore = false;
   for (const source of sources) {
     if (!source.problem) continue;
     source.problem = '';
@@ -1366,10 +1381,10 @@ $('stop').onclick = () => {
   if (stopping()) return;
   if (batch) batch.armed = false;
   stopRequested = true;
-  if (activeClip && ffmpeg) {
-    const {engine} = ffmpeg;
+  if (activeClip) {
+    const engine = ffmpeg?.engine ?? loadingFFmpeg?.engine;
     ffmpeg = null;
-    engine.terminate();
+    engine?.terminate();
   }
   repairQueue = null;
   for (const source of sources) {
@@ -1387,6 +1402,7 @@ $('startOver').onclick = () => {
   items = [];
   batch = null;
   stopRequested = false;
+  clipPausedByCore = false;
   fileInput.value = '';
   updatePreparedPreview();
   renderFiles();
@@ -1409,7 +1425,181 @@ $('settings').open = !confirmedRecipient;
 document.addEventListener('visibilitychange', advanceSchedule);
 for (const event of ['pageshow', 'online', 'offline']) window.addEventListener(event, advanceSchedule);
 
-async function loadFFmpeg(){if(ffmpeg)return ffmpeg;if(loadingFFmpeg)return loadingFFmpeg;loadingFFmpeg=(async()=>{const base=new URL('./',location.href),coreJs=new URL('ffmpeg-core.js',base).href,coreWasm=new URL('ffmpeg-core.wasm',base).href;status('步驟 1/4：檢查本站 FFmpeg 核心…');for(const url of [coreJs,coreWasm]){const r=await fetch(url,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)});if(!r.ok)throw Error('核心檔案無法存取：'+url.split('/').pop()+' HTTP '+r.status)}status('步驟 2/4：載入 FFmpeg 控制程式…');const cdn='https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/';const mod=await import(cdn+'index.js');const util=await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js');status('步驟 3/4：建立手機相容 Worker…');const response=await fetch(cdn+'worker.js',{signal:AbortSignal.timeout(20000)});if(!response.ok)throw Error('Worker 下載失敗：HTTP '+response.status);let source=await response.text();source=source.replace(/(from\s*['"]|import\s*\(\s*['"])(\.\.?\/[^'"]+)/g,(_,prefix,path)=>prefix+new URL(path,cdn).href);log('Worker 程式長度：'+source.length+' 字元');const workerUrl=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));status('步驟 3/4：測試 Worker 是否能啟動…');const probeURL=URL.createObjectURL(new Blob([`postMessage('ready');`],{type:'text/javascript'}));try{await new Promise((resolve,reject)=>{const probe=new Worker(probeURL,{type:'module'});const timer=setTimeout(()=>{probe.terminate();reject(new Error('模組 Worker 測試逾時'))},12000);probe.onmessage=()=>{clearTimeout(timer);probe.terminate();resolve()};probe.onerror=e=>{clearTimeout(timer);probe.terminate();reject(new Error('模組 Worker 無法啟動：'+(e.message||'可能被瀏覽器或 CDN 阻擋')))};probe.onmessageerror=()=>{clearTimeout(timer);probe.terminate();reject(new Error('Worker 訊息格式錯誤'))}});log('Worker 模組測試成功')}finally{URL.revokeObjectURL(probeURL)}status('步驟 3/4：將 UMD 核心轉成 Worker 可載入的模組…');const coreResponse=await fetch(coreJs,{cache:'no-store',signal:AbortSignal.timeout(20000)});if(!coreResponse.ok)throw Error('下載 ffmpeg-core.js 失敗：HTTP '+coreResponse.status);const coreSource=await coreResponse.text();if(!coreSource.includes('createFFmpegCore'))throw Error('ffmpeg-core.js 內容不是預期的 FFmpeg 核心');const moduleSource=coreSource+'\nexport default createFFmpegCore;\n';const coreModuleURL=URL.createObjectURL(new Blob([moduleSource],{type:'text/javascript'}));log('已將本站 UMD 核心包裝成 ES Module（'+moduleSource.length+' 字元）');const engine=new mod.FFmpeg();engine.on('log',({message})=>{if(/error|failed|invalid/i.test(message))log('FFmpeg: '+message.slice(0,160))});status('步驟 4/4：啟動 FFmpeg（最多等待 60 秒）…');let timer;try{await Promise.race([engine.load({classWorkerURL:workerUrl,coreURL:coreModuleURL,wasmURL:coreWasm}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('啟動超過 60 秒；可能是 Worker 或手機記憶體限制')),60000)})])}catch(e){const detail=e instanceof Error?(e.stack||e.message):e&&typeof e==='object'?JSON.stringify(e,Object.getOwnPropertyNames(e)):String(e);log('FFmpeg 啟動錯誤：'+detail.slice(0,1200));try{engine.terminate()}catch(_){}throw new Error(detail==='undefined'?'Worker 啟動失敗，原始錯誤未提供內容（可能是模組載入或核心不相容）':detail)}finally{clearTimeout(timer);URL.revokeObjectURL(workerUrl);URL.revokeObjectURL(coreModuleURL)}ffmpeg={engine,util};status('FFmpeg 核心載入成功');return ffmpeg})();try{return await loadingFFmpeg}catch(e){status('FFmpeg 載入失敗：'+(e?.message||String(e)));throw e}finally{loadingFFmpeg=null}}
+function bootFFmpegWorker() {
+  let core;
+
+  function run(program, args) {
+    try {
+      return core[program](...args);
+    } finally {
+      core.reset();
+    }
+  }
+
+  const commands = {
+    async load(coreURL, wasmURL) {
+      let createCore;
+      try {
+        self.importScripts(coreURL);
+        createCore = self.createFFmpegCore;
+      } catch (error) {
+        if (error.name !== 'SyntaxError') throw new Error('無法載入 ffmpeg-core.js：' + error.message);
+        createCore = (await import(coreURL)).default;
+      }
+      if (typeof createCore !== 'function') throw new Error('ffmpeg-core.js 中找不到 FFmpeg 核心。');
+
+      const wasmLocation = btoa(JSON.stringify({wasmURL}));
+      try {
+        core = await createCore({mainScriptUrlOrBlob: coreURL + '#' + wasmLocation});
+      } catch (error) {
+        throw new Error('無法啟動 ffmpeg-core.wasm：' + (error?.message || String(error)));
+      }
+      core.setLogger(data => self.postMessage({event: 'log', data}));
+      core.setProgress(data => self.postMessage({event: 'progress', data}));
+    },
+    exec: args => run('exec', args),
+    ffprobe: args => run('ffprobe', args),
+    createDir: path => { core.FS.mkdir(path); },
+    deleteDir: path => core.FS.rmdir(path),
+    listDir: path => core.FS.readdir(path).map(name => ({
+      name,
+      isDir: core.FS.isDir(core.FS.stat(path + '/' + name).mode)
+    })),
+    writeFile: (path, bytes) => core.FS.writeFile(path, bytes),
+    readFile: (path, encoding) => core.FS.readFile(path, {encoding}),
+    deleteFile: path => core.FS.unlink(path),
+    mount(type, options, path) {
+      const filesystem = core.FS.filesystems[type];
+      if (!filesystem) return false;
+      core.FS.mount(filesystem, options, path);
+      return true;
+    },
+    unmount: path => core.FS.unmount(path)
+  };
+
+  self.onmessage = async ({data: {id, command, args}}) => {
+    try {
+      const result = await commands[command](...args);
+      const transfers = result instanceof Uint8Array ? [result.buffer] : [];
+      self.postMessage({id, result}, transfers);
+    } catch (error) {
+      self.postMessage({id, error: error?.message || String(error)});
+    }
+  };
+}
+
+function createFFmpegEngine() {
+  const script = '(' + bootFFmpegWorker.toString() + ')();';
+  const workerURL = URL.createObjectURL(new Blob([script], {type: 'text/javascript'}));
+  let worker;
+  try {
+    worker = new Worker(workerURL);
+  } catch (error) {
+    URL.revokeObjectURL(workerURL);
+    throw error;
+  }
+
+  const pending = new Map();
+  const listeners = {log: new Set(), progress: new Set()};
+  let nextId = 0;
+  let failure;
+
+  function request(command, args, transfers = []) {
+    if (failure) return Promise.reject(failure);
+    return new Promise((resolve, reject) => {
+      const id = nextId++;
+      pending.set(id, {resolve, reject});
+      try {
+        worker.postMessage({id, command, args}, transfers);
+      } catch (error) {
+        pending.delete(id);
+        reject(error);
+      }
+    });
+  }
+
+  function terminate(error = new Error('已暫停剪輯。')) {
+    if (failure) return;
+    failure = error;
+    if (ffmpeg?.engine === engine) ffmpeg = null;
+    worker.terminate();
+    URL.revokeObjectURL(workerURL);
+    for (const {reject} of pending.values()) reject(error);
+    pending.clear();
+  }
+
+  const engine = {
+    load: (...args) => request('load', args).finally(() => URL.revokeObjectURL(workerURL)),
+    exec: args => request('exec', [args]),
+    ffprobe: args => request('ffprobe', [args]),
+    createDir: path => request('createDir', [path]),
+    deleteDir: path => request('deleteDir', [path]),
+    listDir: path => request('listDir', [path]),
+    writeFile: (path, bytes) => request('writeFile', [path, bytes], [bytes.buffer]),
+    readFile: (path, encoding = 'binary') => request('readFile', [path, encoding]),
+    deleteFile: path => request('deleteFile', [path]),
+    mount: (...args) => request('mount', args),
+    unmount: path => request('unmount', [path]),
+    on: (type, listener) => listeners[type].add(listener),
+    off: (type, listener) => listeners[type].delete(listener),
+    terminate
+  };
+
+  worker.onmessage = ({data: {event, data, id, result, error}}) => {
+    if (event) {
+      for (const listener of listeners[event]) listener(data);
+      return;
+    }
+    const response = pending.get(id);
+    if (!response) return;
+    pending.delete(id);
+    if (error) response.reject(new Error(error));
+    else response.resolve(result);
+  };
+  worker.onerror = event => {
+    event.preventDefault();
+    terminate(new Error(event.message || '瀏覽器無法啟動 FFmpeg 背景執行緒。'));
+  };
+  worker.onmessageerror = () => terminate(new Error('瀏覽器無法讀取 FFmpeg 的回應。'));
+  return engine;
+}
+
+function loadFFmpeg() {
+  if (ffmpeg) return Promise.resolve(ffmpeg);
+  if (loadingFFmpeg) return loadingFFmpeg.promise;
+  const loading = {engine: null};
+  loadingFFmpeg = loading;
+  loading.promise = (async () => {
+    if (location.protocol === 'file:') throw new Error('請從 GitHub Pages 工具網址開啟，讓網頁能讀取 FFmpeg 核心。');
+
+    status('正在載入本站的 FFmpeg 核心…');
+    const base = new URL('./', location.href);
+    const engine = createFFmpegEngine();
+    loading.engine = engine;
+    engine.on('log', ({message}) => {
+      if (/error|failed|invalid/i.test(message)) log('FFmpeg: ' + message.slice(0, 160));
+    });
+    const timer = setTimeout(() => {
+      engine.terminate(new Error('下載或啟動 FFmpeg 核心逾時，請重試。'));
+    }, 120_000);
+    try {
+      await engine.load(new URL('ffmpeg-core.js', base).href, new URL('ffmpeg-core.wasm', base).href);
+    } finally {
+      clearTimeout(timer);
+    }
+    ffmpeg = {engine};
+    status('FFmpeg 核心載入成功。');
+    return ffmpeg;
+  })().catch(error => {
+    loading.engine?.terminate(error);
+    const detail = 'FFmpeg 核心載入失敗：' + errorMessage(error);
+    if (!stopRequested) status(detail);
+    throw Object.assign(new Error(detail), {coreUnavailable: true});
+  }).finally(() => {
+    loadingFFmpeg = null;
+  });
+  return loading.promise;
+}
 function numberedAttachmentName(original,index){const match=/\.([a-zA-Z0-9]{1,10})$/.exec(original);const ext=match?match[1].toLowerCase():'mp4';return String(index+1).padStart(4,'0')+'.'+ext}
 async function probeVideo(engine, path, reportPath, fields) {
   try {
@@ -1425,7 +1615,7 @@ async function probeVideo(engine, path, reportPath, fields) {
 }
 
 async function splitVideo(file, highQuality) {
-  const {engine, util} = await loadFFmpeg();
+  const {engine} = await loadFFmpeg();
   if (stopRequested) throw new Error('已暫停剪輯。');
   const jobDir = `/split-${Date.now()}`;
   const inputDir = `${jobDir}/in`;
@@ -1442,7 +1632,7 @@ async function splitVideo(file, highQuality) {
     await engine.createDir(inputDir);
     mounted = await engine.mount('WORKERFS', {blobs: [{name: inputName, data: file}]}, inputDir).catch(() => false);
     if (stopRequested) throw new Error('已暫停剪輯。');
-    if (!mounted) await engine.writeFile(inputPath, await util.fetchFile(file));
+    if (!mounted) await engine.writeFile(inputPath, new Uint8Array(await file.arrayBuffer()));
 
     const info = await probeVideo(engine, inputPath, reportPath,
       'format=duration:stream=codec_type,channels:stream_disposition=attached_pic');
