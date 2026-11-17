@@ -172,6 +172,12 @@
       <ul id="fileList" hidden></ul>
     </fieldset>
     <p class="muted">超過 19 MiB 自動分割。每封一段，附件從 0001 依序命名。</p>
+    <label for="clipQuality">分割畫質</label>
+    <select id="clipQuality" aria-describedby="clipQualityHelp">
+      <option value="standard">標準（剪輯較快）</option>
+      <option value="detail">高畫質（保留更多細節）</option>
+    </select>
+    <p class="muted" id="clipQualityHelp">套用到接下來分割的影片。高畫質可能增加剪輯時間和附件大小。</p>
     <p id="scheduleHint" class="muted" hidden>展開每部影片的「剪輯／發送設定」可手動開始或排程。延後分鐘從啟動批次起算。</p>
   </section>
 
@@ -218,6 +224,8 @@ const GMAIL_SCOPE = 'https://www.googleapis.com/auth/gmail.send';
 const GMAIL_SEND_URL = 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send';
 const GMAIL_UPLOAD_URL = 'https://gmail.googleapis.com/upload/gmail/v1/users/me/messages/send';
 const MESSAGE_MIME_TYPE = 'message/rfc822';
+const DIRECT_UPLOAD_MAX_BYTES = 5_000_000;
+const MIME_LINE_LENGTH = 76;
 const RESUME_CHUNK_SIZE = 4 * MB;
 const UPLOAD_RETRIES = 4;
 const MINUTE = 60_000;
@@ -316,7 +324,8 @@ function render() {
   $('fileCount').textContent = `已選 ${sources.length}／${FILE_LIMIT} 部`;
   $('scheduleHint').hidden = !sources.length;
   for (const source of sources) renderSource(source, canChooseFiles, !!counts.uncertain);
-    const canResumeSending = !!batch?.sendHold && !counts.uncertain;
+
+  const canResumeSending = !!batch?.sendHold && !counts.uncertain;
   const hasManualRequests = sources.some(source => source.clip.requestedAt !== null || source.send.requestedAt !== null);
   $('start').hidden = !!batch && (finished === sources.length || (batch.armed && !canResumeSending));
   $('start').disabled = !sources.length || waitingOnStop || previewing;
@@ -397,9 +406,13 @@ function render() {
     const queue = items.slice(begin).map(item => {
       let label = stateLabels[item.state];
       if (item.upload && item.state === 'ready') label = '待續傳';
-      if (item.upload && item.state === 'sending') {
-        const percent = Math.floor(item.upload.offset / item.upload.message.size * 100);
-        label = percent === 100 ? '已上傳，等待 Gmail 確認' : percent ? `已確認上傳 ${percent}%` : '上傳中';
+      if (item.state === 'sending') {
+        if (item.uploadStartedAt === null) {
+          label = item.packagingMs === null ? '封裝附件' : '建立 Gmail 上傳連線';
+        } else {
+          const percent = item.upload ? Math.floor(item.upload.offset / item.upload.message.size * 100) : 0;
+          label = percent === 100 ? '已上傳，等待 Gmail 確認' : percent ? `已確認上傳 ${percent}%` : '上傳中／等待 Gmail 確認';
+        }
       }
       return `${item.name} — ${(item.size / MB).toFixed(2)} MiB — ${label}`;
     });
@@ -604,7 +617,8 @@ fileInput.onchange = () => {
   status(`已選 ${sources.length} 部影片。`);
   advanceSchedule();
 };
-  const gisScript = document.createElement('script');
+
+const gisScript = document.createElement('script');
 gisScript.src = 'https://accounts.google.com/gsi/client';
 gisScript.async = true;
 gisScript.onload = () => {
@@ -691,7 +705,8 @@ async function prepareSource(source) {
   status(`準備第 ${index + 1}／${sources.length} 部：${file.name}`);
   try {
     if (!file.size) throw new Error('檔案是空的');
-    source.parts = file.size <= MAX ? [{name: file.name, blob: file}] : await splitVideo(file);
+    source.parts = file.size <= MAX ? [{name: file.name, blob: file}]
+      : await splitVideo(file, $('clipQuality').value === 'detail');
     if (!source.parts.length) throw new Error('沒有產生可寄送的影片片段');
   } catch (error) {
     source.parts = null;
@@ -745,20 +760,25 @@ function attachmentSubject(index) {
   return batch.subject + ' ' + String(index + 1).padStart(4, '0');
 }
 
-function bytesToBase64(bytes) {
-  if (typeof bytes.toBase64 === 'function') return bytes.toBase64();
-  let binary = '';
-  for (let offset = 0; offset < bytes.length; offset += 16_384) {
-    binary += String.fromCharCode(...bytes.subarray(offset, offset + 16_384));
+async function blobToBase64(blob, urlSafe = false) {
+  if (typeof Uint8Array.prototype.toBase64 === 'function') {
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    return urlSafe ? bytes.toBase64({alphabet: 'base64url', omitPadding: true}) : bytes.toBase64();
   }
-  return btoa(binary);
+  const encoded = await new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(reader.result.slice(reader.result.indexOf(',') + 1));
+    reader.onerror = () => reject(reader.error || new Error('無法讀取寄送附件。'));
+    reader.readAsDataURL(blob);
+  });
+  return urlSafe ? encoded.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '') : encoded;
 }
 
-async function buildMessage(item, index) {
+function messageLayout(item) {
+  const {index, name: filename, blob} = item;
   const boundary = 'video_' + Date.now() + '_' + index;
   const subject = attachmentSubject(index);
-  const filename = item.name;
-  const header = [
+  const headers = [
     `To: ${batch.email}`,
     `Subject: =?UTF-8?B?${b64utf8(subject)}?=`,
     'MIME-Version: 1.0',
@@ -770,22 +790,39 @@ async function buildMessage(item, index) {
     '',
     b64utf8('影片附件：' + filename),
     `--${boundary}`,
-    `Content-Type: ${item.blob.type || 'application/octet-stream'}; name="attachment"`,
+    `Content-Type: ${blob.type || 'application/octet-stream'}; name="attachment"`,
     `Content-Disposition: attachment; filename="${filename}"`,
     'Content-Transfer-Encoding: base64',
     '',
     ''
-  ].join('\r\n');
-  const parts = [header];
+  ];
+  const header = new Blob([headers.join('\r\n')]);
+  const ending = `--${boundary}--\r\n`;
+  const base64Size = 4 * Math.ceil(blob.size / 3);
+  const size = header.size + ending.length + base64Size + 2 * Math.ceil(base64Size / MIME_LINE_LENGTH);
+  return {header, ending, size};
+}
+
+async function buildMessage(item, layout) {
+  const startedAt = performance.now();
+  const parts = [layout.header];
   // Each 57 input bytes makes one 76-character MIME base64 line.
   const blockSize = 57 * 8192;
   for (let offset = 0; offset < item.blob.size; offset += blockSize) {
     if (mailStopped()) throw retryLater('已暫停準備附件。');
-    const bytes = new Uint8Array(await item.blob.slice(offset, offset + blockSize).arrayBuffer());
-    parts.push(bytesToBase64(bytes).replace(/.{1,76}/g, '$&\r\n'));
+    const base64 = await blobToBase64(item.blob.slice(offset, offset + blockSize));
+    const lines = new Array(Math.ceil(base64.length / MIME_LINE_LENGTH));
+    for (let i = 0; i < lines.length; i++) {
+      const start = i * MIME_LINE_LENGTH;
+      lines[i] = base64.slice(start, start + MIME_LINE_LENGTH);
+    }
+    parts.push(lines.join('\r\n') + '\r\n');
   }
-  parts.push(`--${boundary}--\r\n`);
-  return new Blob(parts, {type: MESSAGE_MIME_TYPE});
+  parts.push(layout.ending);
+  const message = new Blob(parts, {type: MESSAGE_MIME_TYPE});
+  item.packagingMs = performance.now() - startedAt;
+  refresh();
+  return message;
 }
 
 async function gmailRequest(url, accessToken, {method, headers, body}, timeoutMs) {
@@ -816,9 +853,9 @@ async function gmailHttpError(response) {
 }
 
 function useMediaUpload(reason) {
-  if (batch.uploadMode) return;
-  batch.uploadMode = 'media';
-  log(`${reason}，本批改用直接上傳。`);
+  if (batch.resumableUnavailable) return;
+  batch.resumableUnavailable = true;
+  log(`${reason}，本批改用${batch.mediaUnavailable ? '相容寄送方式' : '直接上傳'}。`);
 }
 
 function gmailSessionUrl(locationHeader) {
@@ -835,7 +872,7 @@ function gmailSessionUrl(locationHeader) {
   return null;
 }
 
-async function openGmailUpload(message, accessToken) {
+async function openGmailUpload(size, accessToken) {
   for (let attempt = 0; attempt <= UPLOAD_RETRIES; attempt++) {
     if (mailStopped() || navigator.onLine === false) throw retryLater('續傳連線尚未開啟。');
     const response = await gmailRequest(`${GMAIL_UPLOAD_URL}?uploadType=resumable`, accessToken, {
@@ -843,7 +880,7 @@ async function openGmailUpload(message, accessToken) {
       headers: {
         'Content-Type': 'application/json; charset=UTF-8',
         'X-Upload-Content-Type': MESSAGE_MIME_TYPE,
-        'X-Upload-Content-Length': String(message.size)
+        'X-Upload-Content-Length': String(size)
       },
       body: '{}'
     }, 15_000);
@@ -857,27 +894,27 @@ async function openGmailUpload(message, accessToken) {
       return null;
     }
     if (!temporaryGmailError(response)) throw await gmailHttpError(response);
+    if (!response && attempt > 0 && navigator.onLine !== false) {
+      useMediaUpload('Gmail 續傳連線沒有回覆');
+      return null;
+    }
     if (attempt < UPLOAD_RETRIES) {
       await waitBeforeRetry(attempt);
       continue;
     }
-    if (response || navigator.onLine === false) {
-      throw retryLater('Gmail 續傳連線暫時無法建立。');
-    }
-    useMediaUpload('Gmail 續傳連線沒有回覆');
-    return null;
+    throw retryLater('Gmail 續傳連線暫時無法建立。');
   }
 }
 
 async function sendDirectMessage(message, accessToken) {
   if (mailStopped() || navigator.onLine === false) throw retryLater('附件尚未開始上傳。');
   let response;
-  if (batch.uploadMode !== 'legacy') {
+  if (!batch.mediaUnavailable) {
     response = await gmailRequest(`${GMAIL_UPLOAD_URL}?uploadType=media`, accessToken, {
       method: 'POST', headers: {'Content-Type': MESSAGE_MIME_TYPE}, body: message
     }, 240_000);
     if ([404, 405, 415].includes(response?.status)) {
-      batch.uploadMode = 'legacy';
+      batch.mediaUnavailable = true;
       log('Gmail 直接上傳不支援目前的請求，改用相容寄送方式。');
     } else {
       if (temporaryGmailError(response)) throw uncertainSend('連線未取得 Gmail 寄送確認。');
@@ -885,8 +922,7 @@ async function sendDirectMessage(message, accessToken) {
       return response;
     }
   }
-  const raw = bytesToBase64(new Uint8Array(await message.arrayBuffer()))
-    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+  const raw = await blobToBase64(message, true);
   if (mailStopped() || navigator.onLine === false) throw retryLater('附件尚未開始上傳。');
   response = await gmailRequest(GMAIL_SEND_URL, accessToken, {
     method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({raw})
@@ -966,20 +1002,37 @@ async function uploadGmailMessage(item, accessToken) {
   }
   throw retryLater('已保留上傳進度，可繼續發送。');
 }
-  async function sendOne(item, index) {
-  const message = item.upload?.message || await buildMessage(item, index);
+
+async function prepareGmailMessage(item, accessToken) {
+  const layout = messageLayout(item);
+  const encoding = buildMessage(item, layout);
+  if (batch.resumableUnavailable || (layout.size <= DIRECT_UPLOAD_MAX_BYTES && !batch.mediaUnavailable)) {
+    return {message: await encoding, url: null};
+  }
+  // The MIME size is known, so the empty session request can run while encoding the attachment.
+  const [prepared, session] = await Promise.allSettled([encoding, openGmailUpload(layout.size, accessToken)]);
+  if (session.status === 'rejected') throw session.reason;
+  if (prepared.status === 'rejected') throw prepared.reason;
+  return {message: prepared.value, url: session.value};
+}
+
+async function sendOne(item) {
   if (!connected()) throw Object.assign(retryLater('Gmail 授權已失效。'), {httpStatus: 401});
   const accessToken = token;
+  const prepared = item.upload ? null : await prepareGmailMessage(item, accessToken);
+  const message = item.upload?.message || prepared.message;
+  if (!connected()) throw Object.assign(retryLater('Gmail 授權已失效。'), {httpStatus: 401});
   for (let attempt = 0; attempt < 2; attempt++) {
     if (!item.upload) {
-      const url = batch.uploadMode ? null : await openGmailUpload(message, accessToken);
-      if (!url) {
-        const response = await sendDirectMessage(message, accessToken);
-        return response.json().catch(() => null);
-      }
-      item.upload = {url, message, offset: 0, checkProgress: false, chunked: false, finalUnconfirmed: false};
+      let url = attempt === 0 ? prepared.url : null;
+      if (attempt > 0 && !batch.resumableUnavailable) url = await openGmailUpload(message.size, accessToken);
+      if (url) item.upload = {url, message, offset: 0, checkProgress: false, chunked: false, finalUnconfirmed: false};
     }
-    const response = await uploadGmailMessage(item, accessToken);
+    if (item.uploadStartedAt === null) {
+      item.uploadStartedAt = performance.now();
+      refresh();
+    }
+    const response = item.upload ? await uploadGmailMessage(item, accessToken) : null;
     item.upload = null;
     if (response === 'expired') {
       log(`${item.name} 的上傳連線已過期，重新建立續傳連線。`);
@@ -1001,7 +1054,8 @@ const stopping = () => stopRequested && !!(activeClip || mailBusy() || previewin
 const mailStopped = () => stopRequested || mailStopRequested;
 
 function newBatch() {
-  return {startedAt: null, armed: false, email: '', subject: '', sendHold: ''};
+  return {startedAt: null, armed: false, email: '', subject: '', sendHold: '',
+    resumableUnavailable: false, mediaUnavailable: false};
 }
 
 function automaticPreparedVideos() {
@@ -1159,12 +1213,18 @@ async function uploadAttachment(item) {
   activeUploads.add(item);
   item.state = 'sending';
   item.error = '';
+  item.packagingMs = null;
+  item.uploadStartedAt = null;
   const startedAt = performance.now();
   try {
-    const result = await sendOne(item, item.index);
+    const result = await sendOne(item);
     item.state = 'sent';
     item.blob = null;
-    log(`寄送成功：${item.name}／${((performance.now() - startedAt) / 1000).toFixed(1)} 秒${result?.id ? '／Gmail ID: ' + result.id : ''}`);
+    const finishedAt = performance.now();
+    const total = ((finishedAt - startedAt) / 1000).toFixed(1);
+    const packaging = ((item.packagingMs ?? 0) / 1000).toFixed(1);
+    const sending = ((finishedAt - item.uploadStartedAt) / 1000).toFixed(1);
+    log(`寄送成功：${item.name}／共 ${total} 秒（封裝 ${packaging} 秒，上傳及 Gmail 確認 ${sending} 秒）${result?.id ? '／Gmail ID: ' + result.id : ''}`);
     if (!batch.sendHold && !stopRequested) $('status').textContent = `已寄出 ${item.name}。`;
   } catch (error) {
     const retryable = !!error.retryLater;
@@ -1258,7 +1318,8 @@ async function preparePreview() {
     advanceSchedule();
   }
 }
-  $('start').onclick = startBatch;
+
+$('start').onclick = startBatch;
 $('prepareOnly').onclick = preparePreview;
 $('downloadPrepared').onclick = () => {
   const item = previewAttachments[$('preparedAttachment').value];
@@ -1363,7 +1424,7 @@ async function probeVideo(engine, path, reportPath, fields) {
   }
 }
 
-async function splitVideo(file) {
+async function splitVideo(file, highQuality) {
   const {engine, util} = await loadFFmpeg();
   if (stopRequested) throw new Error('已暫停剪輯。');
   const jobDir = `/split-${Date.now()}`;
@@ -1408,7 +1469,8 @@ async function splitVideo(file) {
       const args = [
         '-hide_banner', '-loglevel', 'error', '-xerror', '-err_detect', 'explode', '-i', inputPath,
         '-map', '0:V:0', '-map', '0:a?', '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2',
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '21', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', highQuality ? 'superfast' : 'ultrafast',
+        '-crf', highQuality ? '19' : '21', '-pix_fmt', 'yuv420p',
         '-maxrate:v', String(videoRate), '-bufsize:v', String(bufferSize),
         // Keep source frame timing and start each segment with an independent frame.
         '-fps_mode:v', 'passthrough', '-enc_time_base:v', '-1', '-bf', '0', '-forced-idr', '1',
