@@ -3,7 +3,7 @@
 </style></head><body><main><h1>📨 大量發送小工具</h1><div class="muted">手機優先｜Gmail 附件寄送｜19MiB 分割｜雙封並行寄送｜無累計容量上限</div>
 <section class="panel"><h2>① Gmail 設定</h2><button id="login">連結 Gmail</button><button class="secondary" id="logout">中斷連線</button><div id="authState" class="muted">尚未連線</div><label>收件人 Email</label><input id="recipient" type="email" placeholder="name@company.com"><label>主旨</label><input id="subject" value="影片附件"></section>
 <section class="panel"><h2>② 選擇影片</h2><label>可一次多選影片</label><input id="files" type="file" accept="video/*" multiple><div class="stats"><div class="stat">影片數<b id="fileCount">0</b></div><div class="stat">待寄附件<b id="pending">0</b></div><div class="stat">累積已寄附件容量<b id="sent">0 MiB</b></div><div class="stat">成功／剩餘封數<b id="counts">0 / 0</b></div></div></section>
-<section class="panel"><h2>③ 分割與寄送</h2><button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="prepare">影片分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試</button><progress id="progress" max="100" value="0"></progress><div id="status" class="notice">請先檢查 FFmpeg 核心，再選擇影片。</div><p class="muted">預設同時寄送最多 2 封；暫停時會等待已開始的郵件完成。寄送時請保持分頁開啟；重新整理會清除未寄送佇列。暫停後可在同一頁繼續。失敗重試前，請先檢查 Gmail 已寄件匣，以免網路中斷造成重複寄送。</p></section>
+<section class="panel"><h2>③ 分割與寄送</h2><button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="prepare">影片分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試</button><progress id="progress" max="100" value="0"></progress><div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div><div id="status" class="notice">請先檢查 FFmpeg 核心，再選擇影片。</div><p class="muted">預設同時寄送最多 2 封；暫停時會等待已開始的郵件完成。寄送時請保持分頁開啟；重新整理會清除未寄送佇列。暫停後可在同一頁繼續。失敗重試前，請先檢查 Gmail 已寄件匣，以免網路中斷造成重複寄送。</p></section>
 <section class="panel"><h2>④ 佇列與紀錄</h2><div id="queueInfo" class="muted">目前沒有佇列</div><pre id="log" aria-live="polite">等待操作…</pre><button class="secondary" id="export">匯出寄送紀錄</button></section></main>
 <script>
 'use strict';
@@ -14,13 +14,12 @@ let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function log(s){const t=new Date().toLocaleTimeString('zh-TW',{hour12:false});logs.push(`[${t}] ${s}`);$('log').textContent=logs.slice(-120).join('\n');$('log').scrollTop=$('log').scrollHeight}
 function status(s){$('status').textContent=s;log(s)}
-function refresh(){const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${(x.blob.size/MB).toFixed(2)}MiB — ${x.state}${x.error?' ('+x.error+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=items.length?Math.round(success/items.length*100):0}
-$('files').addEventListener('change',()=>{if(running){status('處理中請勿更換影片');return}items=[];prepared=false;refresh();status(`已選取 ${$('files').files.length} 部影片`)});
+function refresh(){const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${(x.blob.size/MB).toFixed(2)}MiB — ${x.state}${x.error?' ('+x.error+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0)}
 let gisReady=false,gisError='';const gisScript=document.createElement('script');gisScript.src='https://accounts.google.com/gsi/client';gisScript.async=true;gisScript.onload=()=>{gisReady=!!window.google?.accounts?.oauth2;log(gisReady?'Google 登入元件已就緒':'Google 登入元件未初始化')};gisScript.onerror=()=>{gisError='Google 登入元件下載失敗，請檢查網路或內容封鎖';status(gisError)};document.head.appendChild(gisScript);
 $('login').onclick=()=>{try{if(!gisReady||!window.google?.accounts?.oauth2)throw Error(gisError||'Google 登入元件尚未就緒，請稍候 5 秒再按一次');tokenClient=google.accounts.oauth2.initTokenClient({client_id:GOOGLE_CLIENT_ID,scope:GMAIL_SCOPE,callback:r=>{if(r.error){status('Gmail 授權失敗：'+r.error+(r.error_description?' / '+r.error_description:''));return}if(!r.access_token){status('Google 沒有回傳授權憑證');return}token=r.access_token;$('authState').textContent='Gmail 已授權（此分頁有效）';status('Gmail 已連線')},error_callback:e=>status('Google 登入視窗錯誤：'+(e.type||'unknown')+'。請檢查 Chrome 彈出式視窗設定')});status('正在開啟 Google 授權視窗…');tokenClient.requestAccessToken({prompt:'consent'})}catch(e){status('Gmail 登入無法啟動：'+e.message)}};
 $('logout').onclick=()=>{if(token&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(token,()=>{});token='';$('authState').textContent='尚未連線';status('已中斷 Gmail 連線')};
 async function loadFFmpeg(){if(ffmpeg)return ffmpeg;if(loadingFFmpeg)return loadingFFmpeg;loadingFFmpeg=(async()=>{const base=new URL('./',location.href),coreJs=new URL('ffmpeg-core.js',base).href,coreWasm=new URL('ffmpeg-core.wasm',base).href;status('步驟 1/4：檢查本站 FFmpeg 核心…');for(const url of [coreJs,coreWasm]){const r=await fetch(url,{method:'HEAD',cache:'no-store',signal:AbortSignal.timeout(15000)});if(!r.ok)throw Error('核心檔案無法存取：'+url.split('/').pop()+' HTTP '+r.status)}status('步驟 2/4：載入 FFmpeg 控制程式…');const cdn='https://cdn.jsdelivr.net/npm/@ffmpeg/ffmpeg@0.12.15/dist/esm/';const mod=await import(cdn+'index.js');const util=await import('https://cdn.jsdelivr.net/npm/@ffmpeg/util@0.12.2/dist/esm/index.js');status('步驟 3/4：建立手機相容 Worker…');const response=await fetch(cdn+'worker.js',{signal:AbortSignal.timeout(20000)});if(!response.ok)throw Error('Worker 下載失敗：HTTP '+response.status);let source=await response.text();source=source.replace(/(from\s*['"]|import\s*\(\s*['"])(\.\.?\/[^'"]+)/g,(_,prefix,path)=>prefix+new URL(path,cdn).href);log('Worker 程式長度：'+source.length+' 字元');const workerUrl=URL.createObjectURL(new Blob([source],{type:'text/javascript'}));status('步驟 3/4：測試 Worker 是否能啟動…');const probeURL=URL.createObjectURL(new Blob([`postMessage('ready');`],{type:'text/javascript'}));try{await new Promise((resolve,reject)=>{const probe=new Worker(probeURL,{type:'module'});const timer=setTimeout(()=>{probe.terminate();reject(new Error('模組 Worker 測試逾時'))},12000);probe.onmessage=()=>{clearTimeout(timer);probe.terminate();resolve()};probe.onerror=e=>{clearTimeout(timer);probe.terminate();reject(new Error('模組 Worker 無法啟動：'+(e.message||'可能被瀏覽器或 CDN 阻擋')))};probe.onmessageerror=()=>{clearTimeout(timer);probe.terminate();reject(new Error('Worker 訊息格式錯誤'))}});log('Worker 模組測試成功')}finally{URL.revokeObjectURL(probeURL)}status('步驟 3/4：將 UMD 核心轉成 Worker 可載入的模組…');const coreResponse=await fetch(coreJs,{cache:'no-store',signal:AbortSignal.timeout(20000)});if(!coreResponse.ok)throw Error('下載 ffmpeg-core.js 失敗：HTTP '+coreResponse.status);const coreSource=await coreResponse.text();if(!coreSource.includes('createFFmpegCore'))throw Error('ffmpeg-core.js 內容不是預期的 FFmpeg 核心');const moduleSource=coreSource+'\nexport default createFFmpegCore;\n';const coreModuleURL=URL.createObjectURL(new Blob([moduleSource],{type:'text/javascript'}));log('已將本站 UMD 核心包裝成 ES Module（'+moduleSource.length+' 字元）');const engine=new mod.FFmpeg();engine.on('log',({message})=>{if(/error|failed|invalid/i.test(message))log('FFmpeg: '+message.slice(0,160))});status('步驟 4/4：啟動 FFmpeg（最多等待 60 秒）…');let timer;try{await Promise.race([engine.load({classWorkerURL:workerUrl,coreURL:coreModuleURL,wasmURL:coreWasm}),new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('啟動超過 60 秒；可能是 Worker 或手機記憶體限制')),60000)})])}catch(e){const detail=e instanceof Error?(e.stack||e.message):e&&typeof e==='object'?JSON.stringify(e,Object.getOwnPropertyNames(e)):String(e);log('FFmpeg 啟動錯誤：'+detail.slice(0,1200));try{engine.terminate()}catch(_){}throw new Error(detail==='undefined'?'Worker 啟動失敗，原始錯誤未提供內容（可能是模組載入或核心不相容）':detail)}finally{clearTimeout(timer);URL.revokeObjectURL(workerUrl);URL.revokeObjectURL(coreModuleURL)}ffmpeg={engine,util};status('FFmpeg 核心載入成功');return ffmpeg})();try{return await loadingFFmpeg}catch(e){status('FFmpeg 載入失敗：'+(e?.message||String(e)));throw e}finally{loadingFFmpeg=null}}
-$('testCore').onclick=async()=>{if(running)return;running=true;try{await loadFFmpeg()}catch(e){log('核心診斷：'+(e?.message||String(e)))}finally{running=false}};
+$('testCore').onclick=async()=>{if(running)return;setBusy(true);try{await loadFFmpeg()}catch(e){log('核心診斷：'+(e?.message||String(e)))}finally{setBusy(false)}};
 function clean(s){return s.replace(/[^a-zA-Z0-9._-]/g,'_').slice(0,70)||'video'}
 function errorMessage(error) {
   if (error?.message) return String(error.message);
@@ -31,237 +30,258 @@ function errorMessage(error) {
   } catch (_) {}
   return 'FFmpeg 未回傳錯誤內容';
 }
-async function splitVideo(file) {
-  for (const useWorkerFS of [true, false]) {
-    try {
-      return await splitVideoOnce(file, useWorkerFS);
-    } catch (error) {
-      if (ffmpeg) {
-        try { ffmpeg.engine.terminate() } catch (_) {}
-        ffmpeg = null;
-      }
-      if (stopRequested || !useWorkerFS) throw Error(errorMessage(error));
-      log('首次分割失敗：' + errorMessage(error));
-      status('正在重建影片核心，改用完整讀取影片重試…');
-    }
-  }
+let inputCopies = new WeakMap(), selectionReady = Promise.resolve(), selectionEpoch = 0;
+let prepProgress = null, workMeter = null;
+function setBusy(value) {
+  running = value;
+  for (const id of ['files','login','logout','prepare','send','retry','testCore']) $(id).disabled = value;
 }
-async function splitVideoOnce(file, useWorkerFS) {
-  const {engine, util} = await loadFFmpeg();
-  const jobDir = '/split_' + Date.now();
-  const inputDir = jobDir + '/input';
-  const inputName = 'source_' + clean(file.name);
-  const source = inputDir + '/' + inputName;
-  const ext = file.name.split('.').pop().toLowerCase();
-  const outputExt = ['webm', 'mkv'].includes(ext) ? ext : 'mp4';
-  const mimeType = {mp4: 'video/mp4', webm: 'video/webm', mkv: 'video/x-matroska'}[outputExt];
-  const outputPattern = jobDir + '/part_%06d.' + outputExt;
-  const displayName = file.name.replace(/\.[^.]+$/, '');
-  let mounted = false;
-  let written = false;
-  let cleanupFailed = false;
-  let phase = '建立影片暫存目錄';
-  const messages = [];
-  const captureLog = ({message}) => {
-    messages.push(String(message));
-    if (messages.length > 30) messages.shift();
-  };
-  engine.on('log', captureLog);
-
+function checkStop() { if (stopRequested) throw Error('已暫停影片分割，可重新按影片分割'); }
+function fileReadError(file, error) {
+  return Error(`無法讀取「${file.name}」：${errorMessage(error)}。請先把影片儲存到手機「下載」資料夾，再從「檔案」重新選取；重建核心無法修復檔案存取問題。`);
+}
+async function checkReadable(file) {
   try {
-    await engine.createDir(jobDir);
-    await engine.createDir(inputDir);
-    status(`載入影片：${file.name} (${(file.size / MB).toFixed(1)}MiB)`);
-    phase = '讀取原始影片';
-    if (useWorkerFS) {
+    if (!file.size) throw Error('檔案是空的');
+    await file.slice(0, Math.min(file.size, 65536)).arrayBuffer();
+    if (file.size > 65536) await file.slice(-65536).arrayBuffer();
+  } catch (error) { throw fileReadError(file, error); }
+}
+$('files').addEventListener('change', () => {
+  const epoch = ++selectionEpoch, files = Array.from($('files').files);
+  inputCopies = new WeakMap(); items = []; prepared = false; prepProgress = null;
+  refresh(); status(`已選取 ${files.length} 部影片，正在檢查讀取…`);
+  selectionReady = (async () => {
+    let budget = 96 * MB, failures = 0;
+    for (const file of files) {
+      if (epoch !== selectionEpoch) return;
       try {
-        mounted = await engine.mount('WORKERFS', {blobs: [{name: inputName, data: file}]}, inputDir);
+        if (file.size && file.size <= budget) {
+          const data = await file.arrayBuffer();
+          if (data.byteLength !== file.size) throw Error('影片讀取不完整');
+          if (epoch !== selectionEpoch) return;
+          inputCopies.set(file, new Blob([data], {type:file.type})); budget -= file.size;
+          log(`已保留可讀副本：${file.name} (${(file.size / MB).toFixed(1)}MiB)`);
+        } else await checkReadable(file);
       } catch (error) {
-        log('改用完整讀取影片：' + errorMessage(error));
+        failures++;
+        if (epoch === selectionEpoch) log(errorMessage(error));
       }
     }
-    if (!mounted) {
-      await engine.writeFile(source, await util.fetchFile(file));
-      written = true;
+    if (epoch === selectionEpoch && !running) status(failures
+      ? `${failures} 部影片讀取失敗，請從手機「檔案／下載」重新選取`
+      : `已選取 ${files.length} 部影片，讀取檢查完成`);
+  })().catch(error => log(errorMessage(error)));
+});
+function beginMeter(engine, title, duration = 0) {
+  let percent = null, processed = 0, lastLog = 0, alive = true;
+  const start = performance.now();
+  const render = () => {
+    if (!alive) return;
+    const elapsed = (performance.now() - start) / 1000;
+    $('workProgress').textContent = `${title}｜${percent === null ? '處理中' : '約 ' + Math.floor(percent) + '%'}｜已用 ${elapsed.toFixed(0)} 秒`;
+    if (percent !== null && prepProgress) {
+      $('progress').value = (prepProgress.index + percent / 100) / prepProgress.total * 100;
+    } else $('progress').removeAttribute('value');
+    if (elapsed - lastLog >= 15) {
+      log(`${title}：已用 ${elapsed.toFixed(0)} 秒${processed ? '，處理到 ' + processed.toFixed(1) + ' 秒' : ''}`);
+      lastLog = elapsed;
     }
-
-    let duration = 0;
-    let videoCodec = '';
-    const readMediaInfo = ({message}) => {
-      const time = message.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
-      if (time) duration = Number(time[1]) * 3600 + Number(time[2]) * 60 + Number(time[3]);
-      const video = message.match(/Stream #0:\d+(?:\[[^\]]+\])?(?:\([^)]*\))?: Video: (\w+)/);
-      if (!videoCodec && video && !message.includes('(attached pic)')) videoCodec = video[1];
+  };
+  const onProgress = ({time}) => {
+    if (duration > 0 && Number.isFinite(time) && time >= 0) {
+      processed = Math.max(processed, time / 1000000);
+      percent = Math.min(99, processed / duration * 100);
+      render();
+    }
+  };
+  if (engine) engine.on('progress', onProgress);
+  const timer = setInterval(render, 1000); render();
+  const finish = () => {
+    if (!alive) return;
+    alive = false; clearInterval(timer);
+    if (engine) engine.off('progress', onProgress);
+    log(`${title}：耗時 ${((performance.now() - start) / 1000).toFixed(1)} 秒`);
+    if (workMeter === finish) workMeter = null;
+  };
+  workMeter = finish;
+  return finish;
+}
+async function splitVideo(file) {
+  // Readability failures never restart the engine or repeat an expensive job.
+  const input = inputCopies.get(file) || file;
+  await checkReadable(input);
+  const started = performance.now();
+  const {engine} = await loadFFmpeg();
+  const dir = '/split_' + Date.now(), inputDir = dir + '/input';
+  const sourceName = 'source_' + clean(file.name), source = inputDir + '/' + sourceName;
+  const ext = file.name.split('.').pop().toLowerCase();
+  const outExt = ['webm','mkv'].includes(ext) ? ext : 'mp4';
+  const mime = {mp4:'video/mp4',webm:'video/webm',mkv:'video/x-matroska'}[outExt];
+  const pattern = dir + '/part_%06d.' + outExt, keyPath = dir + '/keyframe.bin';
+  let mounted = false, written = false, phase = '讀取原始影片', failedCleanup = false;
+  let duration = 0, videoCodec = '', audioStreams = 0;
+  const messages = [];
+  const capture = ({message}) => { messages.push(String(message)); if (messages.length > 12) messages.shift(); };
+  engine.on('log', capture);
+  const timed = async (title, action, seconds = 0) => {
+    phase = title; status(`${title}：${file.name}`);
+    const finish = beginMeter(engine, title, seconds);
+    try { checkStop(); const result = await action(); checkStop(); return result; }
+    finally { finish(); }
+  };
+  const clearParts = async () => {
+    for (const entry of await engine.listDir(dir)) {
+      if (!entry.isDir && (entry.name.startsWith('part_') || entry.name === 'keyframe.bin')) await engine.deleteFile(dir + '/' + entry.name);
+    }
+  };
+  try {
+    await engine.createDir(dir); await engine.createDir(inputDir);
+    await timed('載入影片', async () => {
+      // Small phone videos use one memory import instead of repeated synchronous storage reads.
+      if (file.size > 96 * MB) {
+        try { mounted = await engine.mount('WORKERFS', {blobs:[{name:sourceName,data:input}]}, inputDir); }
+        catch (error) { log('直接讀取模式不可用，改用記憶體載入：' + errorMessage(error)); }
+      }
+      if (!mounted) {
+        let bytes;
+        try { bytes = new Uint8Array(await input.arrayBuffer()); }
+        catch (error) { throw fileReadError(file, error); }
+        if (bytes.byteLength !== file.size) throw fileReadError(file, Error('影片讀取不完整'));
+        await engine.writeFile(source, bytes); written = true;
+      }
+      inputCopies.delete(file);
+    });
+    const mediaInfo = ({message}) => {
+      const t = message.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+      if (t) duration = Number(t[1])*3600 + Number(t[2])*60 + Number(t[3]);
+      const v = message.match(/Stream #0:\d+(?:\[[^\]]+\])?(?:\([^)]*\))?: Video: (\w+)/);
+      if (v && !videoCodec && !message.includes('(attached pic)')) videoCodec = v[1];
+      if (/Stream #0:.*Audio:/.test(message)) audioStreams++;
     };
-    phase = '讀取影片資訊';
-    engine.on('log', readMediaInfo);
-    try {
-      await engine.exec(['-hide_banner', '-i', source]);
-    } finally {
-      engine.off('log', readMediaInfo);
-    }
-    if (!duration) throw Error('無法讀取影片時長，請先轉成 MP4');
-
-    const initialSeconds = Math.max(0.5, duration * MAX / file.size * 0.78);
-    const videoEncoding = outputExt === 'webm'
-      ? ['-c:v', 'libvpx-vp9', '-deadline', 'realtime', '-cpu-used', '6', '-lag-in-frames', '0', '-crf', '32', '-b:v', '0', '-c:a', 'libopus']
-      : ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '23', '-bf', '0', '-pix_fmt', 'yuv420p', '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-c:a', 'aac'];
-    const keyframeFilter = {
-      h264: 'h264_mp4toannexb,filter_units=pass_types=5',
-      hevc: 'hevc_mp4toannexb,filter_units=pass_types=20'
-    }[videoCodec];
-    const copySupported = keyframeFilter || ['vp8', 'vp9', 'av1'].includes(videoCodec);
-    const keyframePath = jobDir + '/keyframe.bin';
-
-    // One sequential muxing pass allocates each source packet to only one part.
-    // If a keyframe interval is too large, encode new keyframes before splitting.
-    for (const encode of copySupported ? [false, true] : [true]) {
-      let seconds = initialSeconds;
-      let lastLargest = 0;
-      for (let attempt = 0; attempt < (encode ? 4 : 3); attempt++) {
-        if (stopRequested) throw Error('已暫停準備程序');
-        status(`${encode ? '依切點重新編碼並分割' : '沿原片連續分割'}：${file.name}`);
-        const interval = seconds.toFixed(3);
-        const options = encode
-          ? [...videoEncoding, '-fps_mode:v', 'passthrough', '-enc_time_base:v', '-1',
-            '-force_key_frames', `expr:gte(t,n_forced*${interval})`]
-          : ['-c', 'copy'];
-        messages.length = 0;
-        phase = encode ? '重新編碼並連續分割' : '沿原片連續分割';
-        const code = await engine.exec([
-          '-i', source, '-map', '0:V:0', '-map', '0:a?', ...options,
-          '-f', 'segment', '-reference_stream', 'v:0', '-segment_time', interval,
-          '-reset_timestamps', '1', '-y', outputPattern
-        ]);
-        phase = '讀取分割檔案清單';
-        const paths = (await engine.listDir(jobDir))
-          .filter(entry => !entry.isDir && entry.name.startsWith('part_'))
-          .map(entry => jobDir + '/' + entry.name)
-          .sort();
-
-        const result = [];
-        let largest = 0;
-        let unsafeStart = false;
-        try {
-          if (stopRequested) throw Error('已暫停準備程序');
-          if (code !== 0 || paths.length === 0) break;
-          for (let i = 0; i < paths.length; i++) {
-            if (stopRequested) throw Error('已暫停準備程序');
-            const path = paths[i];
-            phase = '讀取分割片段 ' + (i + 1);
-            const data = await engine.readFile(path);
-            if (!data.byteLength) throw Error('分割產生空檔案，請重新準備影片');
-            largest = Math.max(largest, data.byteLength);
-            if (largest <= MAX) {
-              if (!encode && keyframeFilter) {
-                // An open GOP can start with a keyframe that still needs a previous part.
-                try {
-                  messages.length = 0;
-                  phase = '檢查片段起始畫面 ' + (i + 1);
-                  const check = await engine.exec([
-                    '-i', path, '-map', '0:v:0', '-c:v', 'copy', '-frames:v', '1',
-                    '-bsf:v', keyframeFilter, '-f', videoCodec, '-y', keyframePath
-                  ]);
-                  unsafeStart = check !== 0 || (await engine.readFile(keyframePath)).byteLength === 0;
-                } catch (_) {
-                  unsafeStart = true;
-                } finally {
-                  try { await engine.deleteFile(keyframePath) } catch (_) {}
-                }
-                if (unsafeStart) break;
-              }
-              result.push({
-                name: `${displayName}_part${String(i + 1).padStart(3, '0')}.${outputExt}`,
-                blob: new Blob([data], {type: mimeType}),
-                state: 'ready'
-              });
-            } else {
-              result.length = 0;
-            }
-            await engine.deleteFile(path);
-          }
-        } finally {
-          try {
-            for (const entry of await engine.listDir(jobDir)) {
-              if (!entry.isDir && entry.name.startsWith('part_')) {
-                await engine.deleteFile(jobDir + '/' + entry.name);
-              }
-            }
-          } catch (error) {
-            cleanupFailed = true;
-            log('片段暫存清理失敗：' + errorMessage(error));
-          }
-        }
-        if (cleanupFailed) throw Error('無法清除片段暫存，正在重建影片核心');
-        if (unsafeStart) break;
-        if (result.length) {
-          status(`已分割 ${file.name}：共 ${result.length} 段，最大 ${(largest / MB).toFixed(2)}MiB`);
-          return result;
-        }
-        const shorter = Math.max(0.5, seconds * Math.min(0.65, (MAX / largest) * 0.85));
-        if (shorter >= seconds || (!encode && largest === lastLargest)) break;
-        lastLargest = largest;
-        seconds = shorter;
+    engine.on('log', mediaInfo);
+    try { await timed('讀取影片資訊', () => engine.exec(['-hide_banner','-i',source])); }
+    finally { engine.off('log', mediaInfo); }
+    if (!(duration > 0) || !videoCodec) throw Error('無法讀取影片時長或影像編碼');
+    log(`影片資訊：${duration.toFixed(2)} 秒／${videoCodec}／${audioStreams} 音軌`);
+    const filter = {h264:'h264_mp4toannexb,filter_units=pass_types=5',hevc:'hevc_mp4toannexb,filter_units=pass_types=19|20'}[videoCodec];
+    const canCopy = !!filter || ['vp8','vp9','av1'].includes(videoCodec);
+    let seconds = Math.max(0.1, duration * MAX / file.size * 0.72), lastLargest = 0;
+    // Two copy attempts at most; only one full encoding pass, with bounded output bitrate.
+    for (let pass = canCopy ? 0 : 2; pass < 3; pass++) {
+      checkStop(); await clearParts(); messages.length = 0;
+      const encode = pass === 2;
+      let options = ['-c','copy'];
+      if (encode) {
+        const audioRate = audioStreams * 128000;
+        const videoRate = Math.max(256000, Math.ceil(file.size * 8 / duration * 1.3));
+        seconds = Math.min(seconds, Math.max(0.1, MAX * 8 * 0.60 / (videoRate + audioRate)));
+        const rate = String(videoRate), buffer = String(videoRate);
+        options = outExt === 'webm'
+          ? ['-c:v','libvpx-vp9','-deadline','realtime','-cpu-used','6','-lag-in-frames','0','-b:v',rate,'-maxrate',rate,'-bufsize',buffer,'-c:a','libopus','-b:a','128k']
+          : ['-c:v','libx264','-preset','ultrafast','-crf','23','-maxrate',rate,'-bufsize',buffer,'-bf','0','-flags','+cgop','-x264-params','open-gop=0','-pix_fmt','yuv420p','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2','-c:a','aac','-b:a','128k'];
+        options.push('-fps_mode:v','passthrough','-enc_time_base:v','-1','-force_key_frames',`expr:gte(t,n_forced*${seconds.toFixed(3)})`);
+        log('直接分割無法同時符合片段大小或起始畫面要求，改為一次重新編碼；這一步會較慢');
       }
+      const code = await timed(encode ? '重新編碼並分割（一次）' : `沿原片連續分割（第 ${pass+1}/2 次）`, () => engine.exec([
+        '-hide_banner','-i',source,'-map','0:V:0','-map','0:a?',...options,
+        '-f','segment','-reference_stream','v:0','-segment_time',seconds.toFixed(3),
+        '-reset_timestamps','1','-y',pattern
+      ]), duration);
+      if (code !== 0) {
+        log('本輪分割失敗：' + messages.slice(-4).join(' | '));
+        if (encode) throw Error('重新編碼失敗');
+        pass = 1; continue;
+      }
+      const paths = (await engine.listDir(dir)).filter(e => !e.isDir && e.name.startsWith('part_')).map(e => dir+'/'+e.name).sort();
+      if (!paths.length) throw Error('沒有產生分割片段');
+      const result = []; let largest = 0, unsafe = false;
+      await timed('檢查片段與附件大小', async () => {
+        for (let i = 0; i < paths.length; i++) {
+          checkStop(); phase = `檢查片段 ${i+1}/${paths.length}`;
+          const data = await engine.readFile(paths[i]);
+          if (!data.byteLength) throw Error('分割產生空檔案');
+          largest = Math.max(largest, data.byteLength);
+          if (!encode && filter && largest <= MAX) {
+            const code = await engine.exec(['-hide_banner','-i',paths[i],'-map','0:v:0','-c:v','copy','-frames:v','1','-bsf:v',filter,'-f',videoCodec,'-y',keyPath]);
+            unsafe = code !== 0 || !(await engine.readFile(keyPath)).byteLength;
+            if (unsafe) break;
+          }
+          if (largest <= MAX) result.push({name:`part_${i+1}.${outExt}`,blob:new Blob([data],{type:mime}),state:'ready'});
+          else result.length = 0;
+          await engine.deleteFile(paths[i]);
+        }
+      });
+      if (!unsafe && result.length === paths.length && largest <= MAX) {
+        status(`已分割 ${file.name}：${result.length} 段，最大 ${(largest/MB).toFixed(2)}MiB，總耗時 ${((performance.now()-started)/1000).toFixed(1)} 秒`);
+        return result;
+      }
+      result.length = 0;
+      log(unsafe ? '片段起始畫面需要重新編碼，跳過重複直接分割' : `最大片段 ${(largest/MB).toFixed(2)}MiB，調整切割間隔`);
+      if (encode) throw Error('重新編碼後仍有片段超過 19MiB，已停止，沒有加入寄送佇列');
+      if (unsafe || paths.length === 1 || largest === lastLargest) pass = 1;
+      else seconds = Math.max(0.1, seconds * Math.min(0.6, MAX/largest*0.72));
+      lastLargest = largest;
     }
-    throw Error('無法連續分割成 19MiB 以內的影片；可先將原片轉為 MP4 或改用電腦');
+    throw Error('無法安全分割影片');
   } catch (error) {
     const detail = errorMessage(error);
-    const tail = messages.filter(message => !/^Aborted\(\)$/.test(message)).slice(-8).join(' | ');
-    throw Error(phase + '失敗：' + detail + (tail ? '。FFmpeg：' + tail : ''));
+    if (detail.includes('無法讀取「')) throw error;
+    if (/NotReadableError|File could not be read/.test(detail)) throw fileReadError(file, error);
+    throw Error(phase + '失敗：' + detail + '。' + messages.slice(-4).join(' | '));
   } finally {
-    engine.off('log', captureLog);
+    if (workMeter) workMeter(); engine.off('log', capture);
     try {
-      for (const entry of await engine.listDir(jobDir)) {
-        if (!entry.isDir) await engine.deleteFile(jobDir + '/' + entry.name);
-      }
+      await clearParts();
       if (mounted) await engine.unmount(inputDir);
       if (written) await engine.deleteFile(source);
-      await engine.deleteDir(inputDir);
-      await engine.deleteDir(jobDir);
-    } catch (error) {
-      cleanupFailed = true;
-      log('影片暫存清理失敗：' + errorMessage(error));
-    }
-    if (cleanupFailed && ffmpeg?.engine === engine) {
-      try { engine.terminate() } catch (_) {}
-      ffmpeg = null;
-    }
+      await engine.deleteDir(inputDir); await engine.deleteDir(dir);
+    } catch (error) { failedCleanup = true; log('暫存清理失敗：'+errorMessage(error)); }
+    if (failedCleanup && ffmpeg?.engine === engine) { try { engine.terminate(); } catch (_) {} ffmpeg = null; }
   }
 }
 async function prepare() {
   if (running) return;
-  running = true;
-  stopRequested = false;
+  setBusy(true); stopRequested = false;
+  const started = performance.now();
   try {
     const files = Array.from($('files').files);
     if (!files.length) throw Error('請先選擇影片');
-    items = [];
-    prepared = false;
-    refresh();
+    status('正在確認所選影片可讀取…'); await selectionReady; checkStop();
+    items = []; prepared = false; prepProgress = {index:0,total:files.length}; refresh();
     for (let i = 0; i < files.length; i++) {
-      if (stopRequested) throw Error('已暫停準備程序，請重新準備');
-      const file = files[i];
-      if (!file.size) throw Error(file.name + ' 是空檔案');
-      status(`處理 ${i + 1}/${files.length}：${file.name}`);
-      const parts = file.size <= MAX
-        ? [{name: file.name, blob: file, state: 'ready'}]
-        : await splitVideo(file);
+      checkStop(); prepProgress.index = i;
+      const file = files[i], input = inputCopies.get(file) || file;
+      status(`處理 ${i+1}/${files.length}：${file.name}`);
+      let parts;
+      if (file.size <= MAX) {
+        const finish = beginMeter(null, '讀取附件');
+        try {
+          await checkReadable(input); checkStop();
+          // Snapshot ready attachments so sending does not depend on a temporary Android file reference.
+          const blob = inputCopies.get(file) || new Blob([await file.arrayBuffer()], {type:file.type});
+          if (!blob.size || blob.size !== file.size) throw Error('影片讀取不完整');
+          parts = [{name:file.name,blob,state:'ready'}]; inputCopies.delete(file);
+        } catch (error) { if (stopRequested) throw error; throw fileReadError(file,error); }
+        finally { finish(); }
+      } else parts = await splitVideo(file);
+      checkStop();
       for (const part of parts) {
-        const extension = part.name.match(/\.[^.]+$/)?.[0] || '';
-        part.name = String(items.length + 1).padStart(4, '0') + extension;
+        if (part.blob.size > MAX) throw Error('附件超過 19MiB，已停止');
+        part.name = String(items.length+1).padStart(4,'0') + (part.name.match(/\.[^.]+$/)?.[0] || '');
         items.push(part);
       }
-      refresh();
+      prepProgress.index = i+1; refresh();
     }
-    prepared = true;
+    prepared = true; $('workProgress').textContent = `影片分割完成｜共用 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
     status(`準備完成：共 ${items.length} 個附件，請確認後開始寄送`);
   } catch (error) {
-    prepared = false;
-    status('準備未完成：' + errorMessage(error));
+    prepared = false; $('workProgress').textContent = `已停止｜共用 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
+    status('準備未完成：'+errorMessage(error));
   } finally {
-    running = false;
-    refresh();
+    if (workMeter) workMeter();
+    prepProgress = null; setBusy(false); refresh();
+    $('progress').value = prepared ? 100 : 0;
   }
 }
 $('prepare').onclick=prepare;$('stop').onclick=()=>{stopRequested=true;status('已要求暫停；等待目前操作完成…')};
@@ -270,7 +290,7 @@ function b64urlBytes(bytes){let s='';for(let i=0;i<bytes.length;i+=32768)s+=Stri
 async function sendOne(item,index){const boundary='v448_'+Date.now()+'_'+index,email=$('recipient').value.trim(),subject=($('subject').value.trim()||'影片附件')+' '+String(index+1).padStart(4,'0'),filename=item.name.replace(/[\r\n"\\]/g,'_');const header=`To: ${email}\r\nSubject: =?UTF-8?B?${b64utf8(subject)}?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64utf8('影片附件：'+filename)}\r\n--${boundary}\r\nContent-Type: ${item.blob.type||'application/octet-stream'}; name="attachment"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;const bytes=new Uint8Array(await item.blob.arrayBuffer());let attachment='';for(let i=0;i<bytes.length;i+=3*8192){const part=bytes.subarray(i,i+3*8192);let binary='';for(let j=0;j<part.length;j++)binary+=String.fromCharCode(part[j]);attachment+=btoa(binary)}const raw=b64urlBytes(new TextEncoder().encode(header+attachment+`\r\n--${boundary}--\r\n`));const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({raw})});if(!res.ok){const detail=await res.text();if(res.status===401)token='';throw Error(`Gmail HTTP ${res.status}: ${detail.slice(0,240)}`)}return await res.json()}
 async function sendQueue(failedOnly=false){
   if(running)return;
-  running=true;stopRequested=false;
+  setBusy(true);stopRequested=false;
   try{
     if(!prepared)throw Error('請先完成影片準備');
     if(!token)throw Error('請先連結 Gmail');
@@ -314,7 +334,7 @@ async function sendQueue(failedOnly=false){
     else if(stopRequested)status('已暫停；已啟動的郵件已完成，未寄項目保留');
     else status('本輪處理結束；已確認成功 '+items.filter(x=>x.state==='sent').length+' / '+items.length+' 段');
   }catch(e){status(e?.message||String(e))}
-  finally{running=false;refresh()}
+  finally{setBusy(false);refresh()}
 }
 $('send').onclick=()=>sendQueue(false);$('retry').onclick=()=>sendQueue(true);
 $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new Date().toLocaleString('zh-TW')+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v448-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
