@@ -9,7 +9,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-20-batch-verified';
+const BUILD_TAG='2026-11-20-batch-hotfix2';
 let sentBytes=0, batchPlan=null, batchRunning=false;
 let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=null,loadingFFmpeg=null,logs=[],prepared=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -257,7 +257,7 @@ async function splitVideo(file, windowRange = null) {
     } catch (error) { failedCleanup = true; log('暫存清理失敗：'+errorMessage(error)); }
     if (failedCleanup && ffmpeg?.engine === engine) { try { engine.terminate(); } catch (_) {} ffmpeg = null; }
   }
-                                                                                      }
+                     }
   async function prepare() {
   if (running || batchRunning) return;
   if(batchPlan && items.some(x=>x.state!=='sent')){status('尚有未完成的分批附件，請先寄送或重試，避免遺失進度');return;}
@@ -275,7 +275,7 @@ async function splitVideo(file, windowRange = null) {
       if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片，完成後再選其他影片');
       const file=files[0]; await checkReadable(file);
       // 先建立分批計畫，不在「影片分割」階段把 1.6GB 全部展開至記憶體。
-      batchPlan={file,position:0,window:300,done:false};
+      batchPlan={file,position:0,window:300,pendingEnd:null,duration:null,done:false};
       prepared=true; status('影片超過 1 GB，已自動啟用分批模式：連結 Gmail 後按「開始寄送」，每批約 5 分鐘');
       return;
     }
@@ -392,10 +392,10 @@ async function sendBatchQueue(){
         }
       }
       // Commit the current batch only after every email is confirmed sent.
-      if(plan.pendingEnd!==null){
+      if(Number.isFinite(plan.pendingEnd) && plan.pendingEnd>plan.position){
         plan.position=plan.pendingEnd;
         plan.pendingEnd=null;
-        log(`【本批完成】影片進度 ${plan.position.toFixed(2)} / ${plan.duration.toFixed(2)} 秒；已成功 ${items.length} 封`);
+        log(`【本批完成】影片進度 ${plan.position.toFixed(2)} / ${(Number.isFinite(plan.duration)?plan.duration.toFixed(2):'未知')} 秒；已成功 ${items.length} 封`);
         if(plan.duration&&plan.position>=plan.duration-0.1){plan.done=true;break;}
       }
       if(stopRequested)break;
