@@ -9,7 +9,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-20-adaptive-batch1';
+const BUILD_TAG='2026-11-20-adaptive-batch2-first-split';
 let sentBytes=0, batchPlan=null, batchRunning=false;
 let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=null,loadingFFmpeg=null,logs=[],prepared=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -98,8 +98,8 @@ function beginMeter(engine, title, duration = 0) {
       render();
     }
   };
-    if (engine) engine.on('progress', onProgress);
-  const timer = setInterval(render, 1000); render();
+  if (engine) engine.on('progress', onProgress);
+    const timer = setInterval(render, 1000); render();
   const finish = () => {
     if (!alive) return;
     alive = false; clearInterval(timer);
@@ -216,66 +216,8 @@ async function splitVideo(file, windowRange = null) {
       options = outExt === 'webm'
         ? ['-c:v','libvpx-vp9','-deadline','realtime','-cpu-used','6','-lag-in-frames','0','-b:v',rate,'-maxrate',rate,'-bufsize',rate,'-c:a','libopus','-b:a','128k']
         : ['-c:v','libx264','-preset','ultrafast','-crf','23','-maxrate',rate,'-bufsize',rate,'-bf','0','-flags','+cgop','-x264-params','open-gop=0','-pix_fmt','yuv420p','-vf','pad=ceil(iw/2)*2:ceil(ih/2)*2','-c:a','aac','-b:a','128k'];
-        options.push('-fps_mode:v','passthrough','-enc_time_base:v','-1','-force_key_frames',`expr:gte(t,n_forced*${seconds.toFixed(3)})`);
-      log(windowRange ? '分批採用精準重新編碼，避免片段重疊或漏幀' : '影片編碼不支援直接複製，使用單次重新編碼');
-    }
-    const code = await timed(canCopy ? '沿原片分割（單次）' : '重新編碼並分割（單次）', () => engine.exec([
-      '-hide_banner',...(windowRange?['-ss',windowRange.start.toFixed(3)]:[]),'-i',source,...(windowRange?['-t',windowRange.length.toFixed(3)]:[]),'-map','0:V:0','-map','0:a?',...options,
-      '-f','segment','-reference_stream','v:0','-segment_time',seconds.toFixed(3),
-      '-reset_timestamps','1','-y',pattern
-    ]), windowRange ? windowRange.length : duration);
-    if (code !== 0) throw Error('影片分割失敗：'+messages.slice(-4).join(' | '));
-    const paths = (await engine.listDir(dir)).filter(e => !e.isDir && e.name.startsWith('part_')).map(e => dir+'/'+e.name).sort();
-    if (!paths.length) throw Error('沒有產生分割片段');
-    const result = [];
-    let largest = 0, repaired = 0;
-    // Only split an oversized fragment. Never restart the full original video.
-    const collect = async (path, level = 0) => {
-      checkStop();
-      const data = await engine.readFile(path);
-      if (!data.byteLength) throw Error('分割產生空檔案');
-      if (data.byteLength <= MAX) {
-        largest = Math.max(largest, data.byteLength);
-        result.push({name:`part_${result.length+1}.${outExt}`,blob:new Blob([data],{type:mime}),state:'ready'});
-        await engine.deleteFile(path);
-        if (result.length % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
-        return;
-      }
-      if (level >= 3) throw Error(`片段 ${(data.byteLength/MB).toFixed(2)}MiB 超標，局部分割已達安全重試上限；原始影片不會重新分割`);
-      repaired++;
-      log(`片段 ${(data.byteLength/MB).toFixed(2)}MiB 超過 19MiB，只重新處理此片段`);
-      // Work only on the oversized fragment, preserving the order of all other fragments.
-      const fragmentSeconds = Math.max(0.15, seconds * Math.pow(0.4,level+1) * Math.min(1, TARGET/data.byteLength));
-      const subDir = dir+'/fix_'+level+'_'+repaired;
-      await engine.createDir(subDir);
-      const subPattern = subDir+'/part_%06d.'+outExt;
-      try {
-        const splitCode = await engine.exec(['-hide_banner','-i',path,'-map','0:V:0','-map','0:a?', '-c','copy',
-          '-f','segment','-reference_stream','v:0','-segment_time',fragmentSeconds.toFixed(3),
-          '-reset_timestamps','1','-y',subPattern]);
-        if (splitCode !== 0) throw Error('局部分割失敗，原影片未重新處理');
-        const subPaths = (await engine.listDir(subDir)).filter(e=>!e.isDir&&e.name.startsWith('part_')).map(e=>subDir+'/'+e.name).sort();
-        if (subPaths.length < 2) throw Error('片段內沒有足夠的關鍵影格，無法安全地直接切成 19MiB 以下；已停止以避免畫面損壞');
-        for (const subPath of subPaths) await collect(subPath,level+1);
-        await engine.deleteFile(path);
-      } finally {
-        try {
-          for (const entry of await engine.listDir(subDir)) if (!entry.isDir) await engine.deleteFile(subDir+'/'+entry.name);
-          await engine.deleteDir(subDir);
-        } catch (_) {}
-      }
-    };
-    await timed('逐段檢查容量', async () => {
-      for (let i=0;i<paths.length;i++) {
-        phase = `檢查片段 ${i+1}/${paths.length}`;
-        await collect(paths[i]);
-        if (i%10===0 || i===paths.length-1) status(`檢查片段 ${i+1}/${paths.length}，已保留 ${result.length} 段`);
-      }
-    });
-    status(`已分割 ${file.name}：${result.length} 段，最大 ${(largest/MB).toFixed(2)}MiB，局部調整 ${repaired} 次，總耗時 ${((performance.now()-started)/1000).toFixed(1)} 秒`);
-    return result;
-  } catch (error) {
-    const detail = errorMessage(error);
+      options.push('-fps_mode:v','passthrough','-enc_time_base:v','-1','-force_key_frames',`expr:gte(t,n_forced*${seconds.toFixed(3)})`);
+      const detail = errorMessage(error);
     if (detail.includes('無法讀取「')) throw error;
     if (/NotReadableError|File could not be read/.test(detail)) throw fileReadError(file, error);
     throw Error(phase + '失敗：' + detail + '。' + messages.slice(-4).join(' | '));
@@ -284,7 +226,8 @@ async function splitVideo(file, windowRange = null) {
     try {
       await clearParts();
       if (mounted) await engine.unmount(inputDir);
-      if (written) await engine.deleteFile(source);
+      if (stageFile) await engine.deleteFile(stageFile);
+      if (written) await engine.deleteFile(originalSource);
       await engine.deleteDir(inputDir); await engine.deleteDir(dir);
     } catch (error) { failedCleanup = true; log('暫存清理失敗：'+errorMessage(error)); }
     if (failedCleanup && ffmpeg?.engine === engine) { try { engine.terminate(); } catch (_) {} ffmpeg = null; }
@@ -292,7 +235,7 @@ async function splitVideo(file, windowRange = null) {
 }
 async function prepare() {
   if (running || batchRunning) return;
-  if(batchPlan && items.some(x=>x.state!=='sent')){status('尚有未完成的分批附件，請先寄送或重試，避免遺失進度');return;}
+  if(batchPlan){status('已有大型影片分批計畫；請按「開始寄送」繼續，避免重複分割');return;}
   setBusy(true); stopRequested = false;
   const started = performance.now();
   try {
@@ -304,13 +247,27 @@ async function prepare() {
     const largeFiles=files.filter(f=>f.size>BATCH_THRESHOLD);
     log(`處理模式判斷：門檻 ${(BATCH_THRESHOLD/MB).toFixed(0)}MiB；`+files.map(f=>`${f.name} ${(f.size/MB).toFixed(2)}MiB`).join('、'));
     if(largeFiles.length){
-      if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片，完成後再選其他影片');
+      if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片');
       const file=files[0]; await checkReadable(file);
       // 先建立分批計畫，不在「影片分割」階段把 1.6GB 全部展開至記憶體。
-      const groupCount=Math.max(2,Math.ceil(file.size/(600*MB)));
-      // 大區段只是進度規劃，不複製出數百 MB 中間檔；實際仍以 5 分鐘小批次處理。
+      const groupCount=Math.max(2,Math.ceil(file.size/LARGE_STAGE_LIMIT));
+      // 大區段規劃為低於 1GiB；實際每批先產生可驗證容量的中間影片，再精細分割。
       batchPlan={file,position:0,window:300,pendingEnd:null,duration:null,done:false,groupCount,groupIndex:0};
-      prepared=true; status(`影片超過 1 GB：自動規劃 ${groupCount} 個大區段，每區段再以約 5 分鐘小批次分割寄送`);
+      status(`影片超過 1 GB：預估 ${groupCount} 個大區段；現在立即進行真正的兩階段分割`);
+      log('【首批分割開始】按下影片分割後，立即啟動 FFmpeg；不會自動寄送');
+      const parts=await splitVideo(file,{start:0,length:batchPlan.window});
+      checkStop();
+      if(!parts.length || parts.some(part=>!part.blob?.size||part.blob.size>MAX)) throw Error('第一批分割未產生有效的 19MiB 以下附件');
+      if(!(batchPlan.duration>0)) throw Error('無法取得原始影片總長度');
+      batchPlan.pendingEnd=Math.min(batchPlan.window,batchPlan.duration);
+      for(const part of parts){
+        part.name=String(items.length+1).padStart(4,'0')+(part.name.match(/\.[^.]+$/)?.[0]||'');
+        part.size=part.blob.size;
+        items.push(part);
+      }
+      prepared=true;
+      $('workProgress').textContent=`第一批分割完成｜${parts.length} 段｜耗時 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
+      status(`第一批分割完成：${parts.length} 段，請按「開始寄送」；寄完後自動分割下一批`);
       return;
     }
     log('【一般模式】影片未超過 1GB，沿用原本的完整分割流程');
@@ -341,7 +298,8 @@ async function prepare() {
     prepared = true; $('workProgress').textContent = `影片分割完成｜共用 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
     status(`準備完成：共 ${items.length} 個附件，請確認後開始寄送`);
   } catch (error) {
-        prepared = false; $('workProgress').textContent = `已停止｜共用 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
+    if(batchPlan && !prepared){batchPlan=null;items=[];}
+    prepared = false; $('workProgress').textContent = `已停止｜共用 ${((performance.now()-started)/1000).toFixed(1)} 秒`;
     status('準備未完成：'+errorMessage(error));
   } finally {
     if (workMeter) workMeter();
@@ -364,7 +322,7 @@ async function sendQueue(failedOnly=false){
     if(!targets.length)throw Error('沒有可寄送附件');
     const concurrency=2;
     let cursor=0,haltReason='',active=0;
-    const worker=async()=>{
+      const worker=async()=>{
       while(!stopRequested){
         // JavaScript runs this selection synchronously, preventing duplicate claims.
         if(cursor>=targets.length)return;
@@ -465,7 +423,7 @@ $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new
 $('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>localStorage.setItem('v44_recipient',$('recipient').value));refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
-  log(`程式版本：${BUILD_TAG}；超過 1GB 智慧大區段規劃／每批 5 分鐘；目標 15～19MiB`);
+  log(`程式版本：${BUILD_TAG}；超過 1GB 真正兩階段分割／中間檔低於 900MiB／附件不超過 19MiB`);
   loadFFmpeg().catch(error=>{log('自動檢查失敗，可按「檢查 FFmpeg 核心」重試：'+errorMessage(error));});
 },{once:true});
 </script></body></html>
