@@ -7,9 +7,9 @@
 <section class="panel"><h2>④ 佇列與紀錄</h2><div id="queueInfo" class="muted">目前沒有佇列</div><pre id="log" aria-live="polite">等待操作…</pre><button class="secondary" id="export">匯出寄送紀錄</button></section></main>
 <script>
 'use strict';
-const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
+const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=1024,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-20-probe-output-fix';
+const BUILD_TAG='2026-11-20-browser-validated';
 let sentBytes=0, batchPlan=null, batchRunning=false;
 let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=null,loadingFFmpeg=null,logs=[],prepared=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -145,6 +145,85 @@ function beginMeter(engine, title, duration = 0) {
   workMeter = finish;
   return finish;
 }
+function resetFFmpeg(reason='批次完成') {
+  if(ffmpeg?.engine){try{ffmpeg.engine.terminate()}catch(e){log('核心結束警告：'+errorMessage(e))}}
+  ffmpeg=null;
+  log('FFmpeg Worker 已釋放：'+reason);
+}
+function validateContainerBytes(data,ext,{allowOversize=false,prefixOnly=false}={}){
+  if(!data || data.byteLength<MIN_VIDEO_BYTES)throw Error('影片附件過小或空白，禁止寄送');
+  if(!allowOversize && data.byteLength>MAX)throw Error('影片附件超過 19MiB');
+  if(['mp4','m4v','mov'].includes(ext)){
+    const head=data.subarray(0,Math.min(data.byteLength,65536));
+    const str=(a)=>String.fromCharCode(...a);
+    // This is a fast container sanity check; decoding/metadata validation is still mandatory.
+    if(str(head.subarray(4,8))!=='ftyp')throw Error('MP4/MOV 缺少 ftyp 檔頭');
+    const tail=data.subarray(Math.max(0,data.byteLength-65536));
+    if(!prefixOnly&&!str(head).includes('mdat')&&!str(tail).includes('mdat')&&data.byteLength<131072)
+      throw Error('MP4/MOV 缺少媒體資料區');
+  }
+  if(['webm','mkv'].includes(ext)){
+    if(data.byteLength<4 || data[0]!==0x1a||data[1]!==0x45||data[2]!==0xdf||data[3]!==0xa3)
+      throw Error('WebM/MKV 缺少有效的 EBML 檔頭');
+  }
+}
+async function validateSegment(engine,path,expectedMaxSeconds){
+  let seenVideo=false,seenDuration=0,decodedFrames=0;
+  const observer=({message})=>{
+    const line=String(message);
+    if(/Stream #0:\d+.*Video:/.test(line))seenVideo=true;
+    const m=line.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if(m)seenDuration=Number(m[1])*3600+Number(m[2])*60+Number(m[3]);
+    const frame=line.match(/frame=\s*(\d+)/);
+    if(frame)decodedFrames=Math.max(decodedFrames,Number(frame[1]));
+  };
+  engine.on('log',observer);
+  try{
+    // Decode one real frame, not merely a container header or empty stream copy.
+    const rc=await engine.exec(['-hide_banner','-nostdin','-loglevel','info','-stats','-i',path,
+      '-map','0:v:0','-frames:v','1','-an','-f','null','-']);
+    if(rc!==0||!seenVideo||!(seenDuration>0.05)||decodedFrames<1)
+      throw Error('片段沒有可解碼的影格或有效時長，禁止寄送');
+    if(expectedMaxSeconds && seenDuration>expectedMaxSeconds+15)
+      throw Error('片段時長異常：'+seenDuration.toFixed(2)+' 秒');
+  }finally{engine.off('log',observer)}
+}
+async function validateDirectBlob(blob,ext){
+  const head=new Uint8Array(await blob.slice(0,Math.min(blob.size,65536)).arrayBuffer());
+  // For small files, a header check alone must never be mistaken for a valid video.
+  validateContainerBytes(head,ext,{allowOversize:true,prefixOnly:true});
+  if(blob.size>MAX)throw Error('影片附件超過 19MiB');
+  const browserProbe=()=>new Promise((resolve,reject)=>{
+    const video=document.createElement('video');
+    video.preload='metadata';video.muted=true;
+    const url=URL.createObjectURL(blob);
+    let settled=false;
+    const cleanup=()=>{video.onloadedmetadata=null;video.onerror=null;video.removeAttribute('src');video.load();URL.revokeObjectURL(url)};
+    const done=(error)=>{if(settled)return;settled=true;clearTimeout(timer);cleanup();error?reject(error):resolve()};
+    const timer=setTimeout(()=>done(Error('瀏覽器讀取影片資訊逾時')),10000);
+    video.onloadedmetadata=()=>{
+      if(video.videoWidth>0 && video.videoHeight>0 && Number.isFinite(video.duration) && video.duration>0.05)
+        done();
+      else done(Error('影片缺少有效影像或時長'));
+    };
+    video.onerror=()=>done(Error('瀏覽器無法解析影音內容'));
+    video.src=url;video.load();
+  });
+  try{await browserProbe();log('原始小影片通過瀏覽器影音資訊驗證');return;}
+  catch(e){log('瀏覽器驗證未通過，改用 FFmpeg 檢驗：'+errorMessage(e));}
+  // Browser codec support varies: an FFmpeg probe provides a fallback for MOV/MKV/HEVC.
+  let engine=null,path='/source_verify_'+Date.now()+'_'+Math.floor(Math.random()*100000)+'.'+ext;
+  try{
+    ({engine}=await loadFFmpeg());
+    const bytes=new Uint8Array(await blob.arrayBuffer());
+    await engine.writeFile(path,bytes);
+    await validateSegment(engine,path,0);
+    log('原始小影片通過 FFmpeg 影格驗證');
+  }catch(e){
+    if(/memory access out of bounds|out of memory|RuntimeError/i.test(errorMessage(e)))resetFFmpeg('驗證期間 FFmpeg 記憶體異常');
+    throw Error('原始影片未通過有效性檢驗，禁止寄送：'+errorMessage(e));
+  }finally{if(engine){try{await engine.deleteFile(path)}catch(_){}}}
+}
 async function splitVideo(file, windowRange = null) {
   // Readability failures never restart the engine or repeat an expensive job.
   const input = inputCopies.get(file) || file;
@@ -157,7 +236,7 @@ async function splitVideo(file, windowRange = null) {
   const outExt = ['webm','mkv'].includes(ext) ? ext : 'mp4';
   const mime = {mp4:'video/mp4',webm:'video/webm',mkv:'video/x-matroska'}[outExt];
   const pattern = dir + '/part_%06d.' + outExt, keyPath = dir + '/keyframe.bin';
-  let mounted = false, written = false, phase = '讀取原始影片', failedCleanup = false;
+  let mounted = false, written = false, phase = '讀取原始影片', failedCleanup = false, engineCorrupted = false;
   let duration = 0, videoCodec = '', audioStreams = 0;
   const messages = [];
   const capture = ({message}) => { messages.push(String(message)); if (messages.length > 12) messages.shift(); };
@@ -275,10 +354,11 @@ async function splitVideo(file, windowRange = null) {
     const collect = async (path, level = 0) => {
       checkStop();
       const data = await engine.readFile(path);
-      if (!data.byteLength) throw Error('分割產生空檔案');
+      validateContainerBytes(data,outExt,{allowOversize:true});
       if (data.byteLength <= MAX) {
+        await validateSegment(engine,path,windowRange?windowRange.length:Math.max(seconds*3,15));
         largest = Math.max(largest, data.byteLength);
-        result.push({name:`part_${result.length+1}.${outExt}`,blob:new Blob([data],{type:mime}),state:'ready'});
+        result.push({name:`part_${result.length+1}.${outExt}`,blob:new Blob([data],{type:mime}),state:'ready',validated:true});
         await engine.deleteFile(path);
         if (result.length % 8 === 0) await new Promise(resolve => setTimeout(resolve, 0));
         return;
@@ -318,18 +398,22 @@ async function splitVideo(file, windowRange = null) {
     return result;
   } catch (error) {
     const detail = errorMessage(error);
+    if(/memory access out of bounds|out of memory|abort\(|RuntimeError/i.test(detail))engineCorrupted=true;
     if (detail.includes('無法讀取「')) throw error;
     if (/NotReadableError|File could not be read/.test(detail)) throw fileReadError(file, error);
     throw Error(phase + '失敗：' + detail + '。' + messages.slice(-4).join(' | '));
   } finally {
     if (workMeter) workMeter(); engine.off('log', capture);
+    if(engineCorrupted)resetFFmpeg('WASM 記憶體異常，禁止使用已損壞的檔案系統');
     try {
+      if(!engineCorrupted){
       await clearParts();
       if (mounted) await engine.unmount(inputDir);
       if (written) await engine.deleteFile(source);
       await engine.deleteDir(inputDir); await engine.deleteDir(dir);
+      }
     } catch (error) { failedCleanup = true; log('暫存清理失敗：'+errorMessage(error)); }
-    if (failedCleanup && ffmpeg?.engine === engine) { try { engine.terminate(); } catch (_) {} ffmpeg = null; }
+    if ((failedCleanup||engineCorrupted||windowRange) && ffmpeg?.engine === engine) resetFFmpeg(engineCorrupted?'WASM 記憶體異常':failedCleanup?'暫存清理異常':'完成大型影片小批次');
   }
 }
 async function prepare() {
@@ -346,7 +430,7 @@ async function prepare() {
     const largeFiles=files.filter(f=>f.size>BATCH_THRESHOLD);
     log(`處理模式判斷：門檻 ${(BATCH_THRESHOLD/MB).toFixed(0)}MiB；`+files.map(f=>`${f.name} ${(f.size/MB).toFixed(2)}MiB`).join('、'));
     if(largeFiles.length){
-      if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片，完成後再選其他影片');
+      if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片');
       const file=files[0]; await checkReadable(file);
       // 先建立分批計畫，不在「影片分割」階段把 1.6GB 全部展開至記憶體。
       const groupCount=Math.max(2,Math.ceil(file.size/(600*MB)));
@@ -357,7 +441,7 @@ async function prepare() {
       log('【第一批分割開始】正在執行 FFmpeg；此階段不會寄送 Gmail');
       const parts=await splitVideo(file,{start:0,length:batchPlan.window});
       checkStop();
-      if(!parts.length || parts.some(part=>!part.blob?.size || part.blob.size>MAX))throw Error('第一批沒有產生有效的 19MiB 以下附件');
+      if(!parts.length || parts.some(part=>!part.validated || !part.blob?.size || part.blob.size<MIN_VIDEO_BYTES || part.blob.size>MAX))throw Error('第一批沒有產生有效的 19MiB 以下附件');
       if(!(batchPlan.duration>0))throw Error('無法取得影片總長度，已停止');
       batchPlan.pendingEnd=Math.min(batchPlan.window,batchPlan.duration);
       for(const part of parts){
@@ -385,8 +469,9 @@ async function prepare() {
           // Snapshot ready attachments so sending does not depend on a temporary Android file reference.
           const blob = inputCopies.get(file) || new Blob([await file.arrayBuffer()], {type:file.type});
           if (!blob.size || blob.size !== file.size) throw Error('影片讀取不完整');
-          parts = [{name:file.name,blob,state:'ready'}]; inputCopies.delete(file);
-        } catch (error) { if (stopRequested) throw error; throw fileReadError(file,error); }
+          await validateDirectBlob(blob,file.name.split('.').pop().toLowerCase());
+          parts = [{name:file.name,blob,state:'ready',validated:true}]; inputCopies.delete(file);
+        } catch (error) { if(stopRequested || /缺少|損壞|過小|有效性|禁止寄送|驗證|檢驗/.test(errorMessage(error))) throw error; throw fileReadError(file,error); }
         finally { finish(); }
       } else parts = await splitVideo(file);
       checkStop();
@@ -412,7 +497,7 @@ async function prepare() {
 $('prepare').onclick=prepare;$('stop').onclick=()=>{stopRequested=true;status('已要求暫停；等待目前操作完成…')};
 function b64utf8(s){return btoa(unescape(encodeURIComponent(s)))}
 function b64urlBytes(bytes){let s='';for(let i=0;i<bytes.length;i+=32768)s+=String.fromCharCode(...bytes.subarray(i,i+32768));return btoa(s).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,'')}
-async function sendOne(item,index){const boundary='v448_'+Date.now()+'_'+index,email=$('recipient').value.trim(),subject=($('subject').value.trim()||'影片附件')+' '+(index+1)+'/'+items.length,filename=item.name.replace(/[\r\n"\\]/g,'_');const header=`To: ${email}\r\nSubject: =?UTF-8?B?${b64utf8(subject)}?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64utf8('影片附件：'+filename)}\r\n--${boundary}\r\nContent-Type: ${item.blob.type||'application/octet-stream'}; name="attachment"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;const bytes=new Uint8Array(await item.blob.arrayBuffer());let attachment='';for(let i=0;i<bytes.length;i+=3*8192){const part=bytes.subarray(i,i+3*8192);let binary='';for(let j=0;j<part.length;j++)binary+=String.fromCharCode(part[j]);attachment+=btoa(binary)}const raw=b64urlBytes(new TextEncoder().encode(header+attachment+`\r\n--${boundary}--\r\n`));const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({raw})});if(!res.ok){const detail=await res.text();if(res.status===401)token='';throw Error(`Gmail HTTP ${res.status}: ${detail.slice(0,240)}`)}return await res.json()}
+async function sendOne(item,index){if(!item.validated||!item.blob||item.blob.size<MIN_VIDEO_BYTES||item.blob.size>MAX)throw Error('附件容量異常，禁止寄送');const boundary='v448_'+Date.now()+'_'+index,email=$('recipient').value.trim(),subject=($('subject').value.trim()||'影片附件')+' '+(index+1)+'/'+items.length,filename=item.name.replace(/[\r\n"\\]/g,'_');const header=`To: ${email}\r\nSubject: =?UTF-8?B?${b64utf8(subject)}?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64utf8('影片附件：'+filename)}\r\n--${boundary}\r\nContent-Type: ${item.blob.type||'application/octet-stream'}; name="attachment"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;const bytes=new Uint8Array(await item.blob.arrayBuffer());let attachment='';for(let i=0;i<bytes.length;i+=3*8192){const part=bytes.subarray(i,i+3*8192);let binary='';for(let j=0;j<part.length;j++)binary+=String.fromCharCode(part[j]);attachment+=btoa(binary)}const raw=b64urlBytes(new TextEncoder().encode(header+attachment+`\r\n--${boundary}--\r\n`));const res=await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({raw})});if(!res.ok){const detail=await res.text();if(res.status===401)token='';throw Error(`Gmail HTTP ${res.status}: ${detail.slice(0,240)}`)}return await res.json()}
 async function sendQueue(failedOnly=false){
   if(running)return;
   setBusy(true);
@@ -500,7 +585,7 @@ async function sendBatchQueue(){
       status(`【分批切割】${(start/60).toFixed(1)}～${(end/60).toFixed(1)} 分鐘；完成本批才寄送`);
       const parts=await splitVideo(plan.file,{start,length:plan.window});
       if(!parts.length)throw Error('本批沒有產生影片片段，已停止');
-      if(parts.some(part=>!part.blob?.size||part.blob.size>MAX))throw Error('分批片段為空或超過 19MiB，已停止');
+      if(parts.some(part=>!part.blob?.size||part.blob.size<MIN_VIDEO_BYTES||part.blob.size>MAX||!part.validated))throw Error('分批片段為空或超過 19MiB，已停止');
       // The source duration is read by splitVideo; mark the end before sending.
       if(!(plan.duration>0))throw Error('無法取得原始影片總長度，已停止以避免重複片段');
       plan.pendingEnd=Math.min(start+plan.window,plan.duration);
@@ -520,7 +605,7 @@ async function sendBatchQueue(){
   finally{batchRunning=false;setBusy(false);refresh();}
 }
 $('send').onclick=sendBatchQueue;
-$('retry').onclick=async()=>{if(batchRunning)return;stopRequested=false;await sendQueue(true);if(batchPlan&&!running&&!items.some(x=>x.state!=='sent'))status('失敗片段已重試；按「開始寄送」繼續下一批')};
+$('retry').onclick=async()=>{if(batchRunning)return;stopRequested=false;if(batchPlan&&!items.some(x=>x.state==='failed')){status('沒有失敗的郵件可重試；請按「開始寄送」繼續分割');return;}await sendQueue(true);if(batchPlan&&!running&&!items.some(x=>x.state!=='sent'))status('失敗片段已重試；按「開始寄送」繼續下一批')};
 $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new Date().toLocaleString('zh-TW')+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v448-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
