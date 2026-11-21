@@ -7,9 +7,12 @@
 <section class="panel"><h2>④ 佇列與紀錄</h2><div id="queueInfo" class="muted">目前沒有佇列</div><pre id="log" aria-live="polite">等待操作…</pre><button class="secondary" id="export">匯出寄送紀錄</button></section></main>
 <script>
 'use strict';
-const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=1024,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
+const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-20-browser-validated';
+const BUILD_TAG='2026-11-21-real-two-stage-sequential';
+// 為避免 Android 同時建立多個數百 MiB 檔案，第一階段的實際中間檔一次只保留一份。
+const IS_ANDROID=/Android/i.test(navigator.userAgent);
+const GROUP_TARGET= (IS_ANDROID?240:500)*MB, GROUP_HARD_MAX=(IS_ANDROID?420:800)*MB;
 let sentBytes=0, batchPlan=null, batchRunning=false;
 let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=null,loadingFFmpeg=null,logs=[],prepared=false;
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
@@ -87,7 +90,7 @@ async function checkReadable(file) {
 $('files').addEventListener('change', () => {
   if(batchRunning){status('分批寄送中，請勿更換影片');return;}
   const epoch = ++selectionEpoch, files = Array.from($('files').files);
-  inputCopies = new WeakMap(); items = []; prepared = false; prepProgress = null;
+  inputCopies = new WeakMap(); items = []; prepared = false; prepProgress = null; batchPlan = null; stopRequested = false;
   refresh(); status(`已選取 ${files.length} 部影片，正在檢查讀取…`);
   selectionReady = (async () => {
     let budget = 96 * MB, failures = 0;
@@ -224,14 +227,14 @@ async function validateDirectBlob(blob,ext){
     throw Error('原始影片未通過有效性檢驗，禁止寄送：'+errorMessage(e));
   }finally{if(engine){try{await engine.deleteFile(path)}catch(_){}}}
 }
-async function splitVideo(file, windowRange = null) {
-  // Readability failures never restart the engine or repeat an expensive job.
-  const input = inputCopies.get(file) || file;
-  await checkReadable(input);
+async function splitVideo(file, windowRange = null, virtualInput = null) {
+  // 第二階段可直接讀取 FFmpeg 檔案系統內的中間影片，不複製數百 MiB 到 JS 記憶體。
+  const input = virtualInput ? null : (inputCopies.get(file) || file);
+  if(!virtualInput)await checkReadable(input);
   const started = performance.now();
   const {engine} = await loadFFmpeg();
   const dir = '/split_' + Date.now(), inputDir = dir + '/input';
-  const sourceName = 'source_' + clean(file.name), source = inputDir + '/' + sourceName;
+  const sourceName = 'source_' + clean(file.name), source = virtualInput?.path || (inputDir + '/' + sourceName);
   const ext = file.name.split('.').pop().toLowerCase();
   const outExt = ['webm','mkv'].includes(ext) ? ext : 'mp4';
   const mime = {mp4:'video/mp4',webm:'video/webm',mkv:'video/x-matroska'}[outExt];
@@ -255,6 +258,8 @@ async function splitVideo(file, windowRange = null) {
   try {
     await engine.createDir(dir); await engine.createDir(inputDir);
     await timed('載入影片', async () => {
+      // 第一階段產生的中間影片本來就在 FFmpeg FS，不應再掛載或重讀。
+      if (virtualInput) { log('第二階段：直接使用中間影片 '+source+'，不重新載入大型 Blob'); return; }
       // Small phone videos use one memory import instead of repeated synchronous storage reads.
       if (file.size > 96 * MB) {
         try { mounted = await engine.mount('WORKERFS', {blobs:[{name:sourceName,data:input}]}, inputDir); }
@@ -290,39 +295,56 @@ async function splitVideo(file, windowRange = null) {
     log(`影片資訊：${duration.toFixed(2)} 秒／${videoCodec}／${audioStreams} 音軌`);
     if(windowRange&&batchPlan){batchPlan.duration=duration;if(windowRange.start>=duration)throw Error('已超過影片結尾');windowRange.length=Math.min(windowRange.length,duration-windowRange.start);log(`【分批切割】${windowRange.start.toFixed(2)}～${(windowRange.start+windowRange.length).toFixed(2)} 秒／總長 ${duration.toFixed(2)} 秒`);}
     const filter = {h264:'h264_mp4toannexb,filter_units=pass_types=5',hevc:'hevc_mp4toannexb,filter_units=pass_types=19|20'}[videoCodec];
-    // Batch stream copy is only safe at verified source keyframes on BOTH boundaries.
-    // A failed/inconclusive probe always falls back to the existing accurate re-encode path.
-    const keyframeTimes = async (at) => {
-      const times = [];
-      const scanStart = Math.max(0, at - 2.5);
-      const scanLength = Math.min(duration - scanStart, 5.5);
-      if (!(scanLength > 0)) return times;
+    // Only inspect a short interval close to each boundary. IMPORTANT: -skip_frame is an INPUT
+    // decoder option (before -i); -copyts must NOT be used here. With input -ss, showinfo PTS
+    // is relative to the seek time, so add scanStart to recover the source timeline.
+    const keyframeTimes = async (at, lookBehind=9, lookAhead=28) => {
+      const times = [], scanStart = Math.max(0,at-lookBehind);
+      const scanLength = Math.min(duration-scanStart,lookBehind+lookAhead);
+      if (!(scanLength > 0)) return [];
       const observer = ({message}) => {
         const m = String(message).match(/showinfo.*?pts_time:\s*(-?\d+(?:\.\d+)?)/);
-        if (m) times.push(Number(m[1]));
+        if (m) times.push(scanStart+Number(m[1]));
       };
-      engine.on('log', observer);
+      engine.on('log',observer);
       try {
-        const args = ['-hide_banner','-loglevel','info','-copyts','-ss',scanStart.toFixed(3),'-i',source,
-          '-t',scanLength.toFixed(3),'-map','0:V:0','-an','-skip_frame','nokey',
-          '-vf','showinfo','-f','null','-'];
-        const rc = await engine.exec(args);
-        return rc === 0 ? times.filter(Number.isFinite) : [];
-      } catch (e) { log('關鍵影格檢查無法完成：'+errorMessage(e)); return []; }
-      finally { engine.off('log', observer); }
+        const rc = await engine.exec(['-hide_banner','-nostdin','-loglevel','info',
+          '-ss',scanStart.toFixed(3),'-skip_frame','nokey','-i',source,
+          '-t',scanLength.toFixed(3),'-map','0:V:0','-an','-vf','showinfo','-f','null','-']);
+        if(rc!==0)throw Error('關鍵影格探測返回 '+rc);
+        return [...new Set(times.filter(Number.isFinite).map(x=>Math.max(0,x)))].sort((a,b)=>a-b);
+      } catch(e){log('關鍵影格探測失敗：'+errorMessage(e));return []}
+      finally{engine.off('log',observer)}
     };
     let batchCopySafe = false;
-    if (windowRange && (videoCodec === 'h264' || videoCodec === 'hevc') && outExt === 'mp4') {
-      const start = windowRange.start, end = start + windowRange.length;
-      const tolerance = 0.045; // Strict: no approximation to a distant keyframe.
-      status('正在檢查分批邊界的關鍵影格…');
-      checkStop(); const startKeys = start < tolerance ? [0] : await keyframeTimes(start);
-      checkStop(); const endKeys = end >= duration - tolerance ? [duration] : await keyframeTimes(end);
-      batchCopySafe = startKeys.some(t => Math.abs(t-start) <= tolerance) &&
-        endKeys.some(t => Math.abs(t-end) <= tolerance);
-      log(batchCopySafe ? '分批邊界均符合關鍵影格，嘗試免重新編碼' : '分批邊界不是可確認的關鍵影格，維持精準重新編碼');
+    if (windowRange && (videoCodec==='h264'||videoCodec==='hevc') && outExt==='mp4') {
+      const start=windowRange.start, plannedEnd=Math.min(duration,start+windowRange.length);
+      status('檢查關鍵影格，選擇無重疊的快速分割邊界…');
+      checkStop();
+      // All previous batch ends come from the SAME verified keyframe chosen here.
+      // Refuse to guess a start point: guessing can duplicate or omit pictures.
+      if(start>0.10){
+        const startKeys=await keyframeTimes(start,9,10);
+        if(!startKeys.some(t=>Math.abs(t-start)<0.14))
+          throw Error('無法核對本批起點的關鍵影格；為避免重複或漏畫面，已停止');
+      }
+      checkStop();
+      let actualEnd=duration;
+      if(plannedEnd<duration-0.2){
+        const ends=await keyframeTimes(plannedEnd,12,35);
+        const choices=ends.filter(t=>t>=plannedEnd-12&&t<=plannedEnd+35&&t>start+60);
+        if(!choices.length)throw Error('無法找到安全的大區段結尾關鍵影格，已停止；不會讓手機耗時重新編碼 5 分鐘影片');
+        actualEnd=choices.reduce((a,b)=>Math.abs(a-plannedEnd)<=Math.abs(b-plannedEnd)?a:b);
+      }
+      if(actualEnd<=start+0.05)throw Error('分批終點不合法，已停止');
+      windowRange.length=actualEnd-start;
+      windowRange.actualEnd=actualEnd;
+      batchCopySafe=true;
+      log(`關鍵影格安全快切：${start.toFixed(3)}～${actualEnd.toFixed(3)} 秒（原預計 ${plannedEnd.toFixed(3)} 秒），免重新編碼`);
+    } else if(windowRange) {
+      throw Error(`大型影片的 ${videoCodec}/${outExt} 無法使用已驗證的快切模式；已安全停止，不在手機上重新編碼整段`);
     }
-    const canCopy = batchCopySafe || (!windowRange && (!!filter || ['vp8','vp9','av1'].includes(videoCodec)));
+    const canCopy=batchCopySafe||(!windowRange&&(!!filter||['vp8','vp9','av1'].includes(videoCodec)));
     // Aim below the attachment ceiling. Small final segments are valid.
     const TARGET = 16 * MB; // 以 15～19 MiB 為優先，保留波動餘裕
     let seconds = Math.max(0.25, duration * TARGET / file.size * 0.95);
@@ -394,11 +416,12 @@ async function splitVideo(file, windowRange = null) {
         if (i%10===0 || i===paths.length-1) status(`檢查片段 ${i+1}/${paths.length}，已保留 ${result.length} 段`);
       }
     });
+    if(windowRange)result.actualEnd=windowRange.actualEnd;
     status(`已分割 ${file.name}：${result.length} 段，最大 ${(largest/MB).toFixed(2)}MiB，局部調整 ${repaired} 次，總耗時 ${((performance.now()-started)/1000).toFixed(1)} 秒`);
     return result;
   } catch (error) {
     const detail = errorMessage(error);
-    if(/memory access out of bounds|out of memory|abort\(|RuntimeError/i.test(detail))engineCorrupted=true;
+    if(/memory access out of bounds|out of memory|abort\(|RuntimeError/i.test(detail)){engineCorrupted=true;log('偵測到 FFmpeg WASM 記憶體異常；本批停止且不寄送，將重建核心，已成功寄件不會重寄')}
     if (detail.includes('無法讀取「')) throw error;
     if (/NotReadableError|File could not be read/.test(detail)) throw fileReadError(file, error);
     throw Error(phase + '失敗：' + detail + '。' + messages.slice(-4).join(' | '));
@@ -416,9 +439,202 @@ async function splitVideo(file, windowRange = null) {
     if ((failedCleanup||engineCorrupted||windowRange) && ffmpeg?.engine === engine) resetFFmpeg(engineCorrupted?'WASM 記憶體異常':failedCleanup?'暫存清理異常':'完成大型影片小批次');
   }
 }
+// 實體大區段：先以不重新編碼的方式將原片擷取成 <1GB 的可播放影片；
+// 下一階段只處理這一份中間檔，全部郵件寄送成功後才會建立下一份。
+async function createIntermediate(plan) {
+  const file=plan.file, input=inputCopies.get(file)||file;
+  await checkReadable(input);checkStop();
+  const {engine}=await loadFFmpeg();
+  const dir='/biggroup_'+Date.now()+'_'+Math.floor(Math.random()*100000);
+  const inputDir=dir+'/source',sourceName='source_'+clean(file.name),source=inputDir+'/'+sourceName;
+  const output=dir+'/intermediate_000.mp4', extraOutput=dir+'/intermediate_001.mp4';
+  const ext=file.name.split('.').pop().toLowerCase();
+  let mounted=false,written=false,success=false,duration=plan.duration||0,videoCodec=plan.codec||'',bytes=0,end=0;
+  let step='建立中間影片',lastLines=[];
+  const onLog=({message})=>{const t=String(message);lastLines.push(t);if(lastLines.length>10)lastLines.shift();};
+  engine.on('log',onLog);
+  const meter=async(label,action,time=0)=>{step=label;status(label+'：'+file.name);const done=beginMeter(engine,label,time);try{checkStop();const result=await action();checkStop();return result;}finally{done();}};
+  try{
+    await engine.createDir(dir);await engine.createDir(inputDir);
+    await meter('第一階段：掛載原始影片',async()=>{
+      if(file.size>96*MB){
+        try{mounted=await engine.mount('WORKERFS',{blobs:[{name:sourceName,data:input}]},inputDir)}
+        catch(e){throw Error('Android 無法掛載大型影片：'+errorMessage(e))}
+        if(!mounted)throw Error('無法以 WORKERFS 掛載大型影片；為避免記憶體不足已停止');
+      }else{
+        const data=new Uint8Array(await input.arrayBuffer());
+        if(data.byteLength!==file.size)throw Error('原影片讀取不完整');
+        await engine.writeFile(source,data);written=true;
+      }
+    });
+    if(!duration||!videoCodec){
+      const info=({message})=>{
+        const t=String(message);
+        const m=t.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+        if(m)duration=Number(m[1])*3600+Number(m[2])*60+Number(m[3]);
+        const v=t.match(/Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]*\))*[^\n]*?Video:\s*([\w-]+)/i);
+        if(v&&!videoCodec&&!t.includes('(attached pic)'))videoCodec=v[1];
+      };
+      engine.on('log',info);
+      try{
+        await meter('第一階段：讀取原片資訊',()=>engine.exec(['-hide_banner','-nostdin','-i',source,'-t','0.1','-map','0:v:0','-map','0:a?','-c','copy','-f','null','-']));
+      }finally{engine.off('log',info)}
+      if(!(duration>0)||!videoCodec)throw Error('無法讀取影片時長與編碼，不能安全建立中間檔');
+      plan.duration=duration;plan.codec=videoCodec;
+      plan.groupEstimate=Math.max(1,Math.ceil(file.size/GROUP_TARGET));
+      log(`【兩階段計畫】原片 ${(file.size/MB).toFixed(1)}MiB／${duration.toFixed(2)}秒；預估約 ${plan.groupEstimate} 個中間影片，每份目標 ${(GROUP_TARGET/MB).toFixed(0)}MiB`);
+    }
+    if(!['h264','hevc'].includes(videoCodec)||!['mp4','m4v','mov'].includes(ext))
+      throw Error(`大型影片 ${videoCodec}/${ext} 無法安全免重編碼切成實體中間影片，已停止；不會寄送損壞片段`);
+    const start=plan.position;
+    if(start>=duration-0.10)throw Error('影片已到結尾，不需要建立下一份中間檔');
+    // 除第一個邊界以外，每個起點都必須是上一份使用的同一關鍵影格時間點。
+    const findKeys=async(at,behind=10,ahead=30)=>{
+      const scanStart=Math.max(0,at-behind),len=Math.min(duration-scanStart,behind+ahead);
+      if(!(len>0))return [];
+      const times=[];
+      const observer=({message})=>{const m=String(message).match(/showinfo.*?pts_time:\s*(-?\d+(?:\.\d+)?)/);if(m)times.push(scanStart+Number(m[1]));};
+      engine.on('log',observer);
+      try{
+        const rc=await engine.exec(['-hide_banner','-nostdin','-loglevel','info','-ss',scanStart.toFixed(3),
+          '-skip_frame','nokey','-i',source,'-t',len.toFixed(3),'-map','0:V:0','-an','-vf','showinfo','-f','null','-']);
+        if(rc!==0)throw Error('關鍵影格掃描失敗：'+rc);
+        return [...new Set(times.filter(Number.isFinite).map(x=>Math.max(0,x)))].sort((a,b)=>a-b);
+      }finally{engine.off('log',observer)}
+    };
+    if(start>0.10){
+      const keys=await meter('第一階段：確認上一批結尾關鍵影格',()=>findKeys(start,10,14));
+      if(!keys.some(t=>Math.abs(t-start)<0.14))throw Error('無法驗證上一批終點與本批起點一致；禁止繼續以避免漏幀或重疊');
+    }
+    const remain=duration-start,ratio=file.size/duration;
+    // 用原始影片平均位元率估時，實際輸出大小必須再驗證，超限就縮短時間重試。
+    let goal=Math.min(remain,GROUP_TARGET/ratio*0.90);
+    if(remain-goal<2&&remain*ratio<GROUP_HARD_MAX*0.80)goal=remain;
+    if(!(goal>0))throw Error('無法計算中間影片分割時間');
+    for(let attempt=0;attempt<5;attempt++){
+      checkStop();
+      const planned=Math.min(duration,start+goal);
+      end=duration;
+      if(planned<duration-0.2){
+        const keys=await meter('第一階段：尋找可銜接的分割點',()=>findKeys(planned,12,42));
+        const choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
+        if(!choices.length)throw Error('附近沒有可核對的關鍵影格，已安全停止，避免破圖／畫面重疊');
+        // 以不超過預估位置的關鍵影格為優先，減少大區段容量突然超限的機會。
+        const earlier=choices.filter(t=>t<=planned+0.05);
+        end=(earlier.length?earlier:choices).reduce((a,b)=>Math.abs(a-planned)<=Math.abs(b-planned)?a:b);
+      }
+      if(!(end>start+0.05))throw Error('第一階段的大區段時間邊界無效');
+      const length=end-start;
+      log(`【中間檔 ${plan.groupIndex+1}】原片 ${start.toFixed(3)}～${end.toFixed(3)} 秒；無重新編碼複製，目標 <${(GROUP_HARD_MAX/MB).toFixed(0)}MiB`);
+      // 關鍵修正：含 B-frame 的 H.264/HEVC 若以 -t 直接截斷，會把下一批的 1~2 張影格也寫進本批。
+      // 非最後一批使用 segment muxer 在指定關鍵影格「正確斷包」，避免和下一批重複。
+      const hasNext=end<duration-0.10;
+      const cutArgs=hasNext?[
+        '-ss',start.toFixed(3),'-i',source,
+        '-t',(length+Math.min(2,Math.max(0,duration-end))).toFixed(3),
+        '-map','0:V:0','-map','0:a?','-c','copy',
+        '-f','segment','-reference_stream','v:0','-segment_times',length.toFixed(3),
+        '-segment_time_delta','0.01','-reset_timestamps','1','-y',dir+'/intermediate_%03d.mp4'
+      ]:[
+        '-ss',start.toFixed(3),'-i',source,'-t',length.toFixed(3),
+        '-map','0:V:0','-map','0:a?','-c','copy','-avoid_negative_ts','make_zero','-y',output
+      ];
+      const rc=await meter('第一階段：實際建立中間影片',()=>engine.exec(['-hide_banner','-nostdin',...cutArgs]),length);
+      if(rc!==0)throw Error('中間影片製作失敗：'+lastLines.slice(-4).join(' | '));
+      if(hasNext){
+        const entries=await engine.listDir(dir);
+        if(!entries.some(x=>x.name==='intermediate_001.mp4'))
+          throw Error('中間影片沒有在關鍵影格產生確實斷點，已停止以避免影片重疊');
+        // 切點後的小尾巴只用來安全 flush B-frames，不做為正式影片，下一批從同一關鍵影格接續。
+        await engine.deleteFile(extraOutput);
+      }
+      const raw=await meter('第一階段：檢查中間影片容量',()=>engine.readFile(output));
+      bytes=raw.byteLength;
+      if(bytes>=MIN_VIDEO_BYTES)validateContainerBytes(raw,'mp4',{allowOversize:true});
+      // 不將 raw 轉成 Blob；保留 WASM FS 內的唯一一份實體中間檔供第二階段讀取。
+      if(bytes>=MIN_VIDEO_BYTES&&bytes<GROUP_HARD_MAX&&bytes<BATCH_THRESHOLD){
+        await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
+        success=true;log(`【中間影片完成】第 ${plan.groupIndex+1} 份，${(bytes/MB).toFixed(2)}MiB（小於 1GB），進入第二階段；接下來不製作其他大區段`);
+        break;
+      }
+      log(`中間影片 ${(bytes/MB).toFixed(2)}MiB ${bytes<MIN_VIDEO_BYTES?'無效':'超過手機安全容量'}，只縮短這份中間檔後重試`);
+      try{await engine.deleteFile(output)}catch(_){}
+      try{await engine.deleteFile(extraOutput)}catch(_){}
+      if(bytes<MIN_VIDEO_BYTES)throw Error('中間影片為空或沒有有效內容，已停止');
+      goal=Math.min(goal*0.62,(end-start)*0.62);
+    }
+    if(!success)throw Error('中間影片連續 5 次超過安全容量，已停止，沒有寄送不完整附件');
+    // 工作階段保持掛載：下一階段直接從相同 FFmpeg FS 讀取這個檔案。
+    return {engine,dir,inputDir,source,mounted,written,path:output,
+      name:`group_${plan.groupIndex+1}.mp4`,size:bytes,start,end,duration};
+  }catch(e){
+    const msg=errorMessage(e);
+    log('【第一階段停止】'+step+'：'+msg);
+    if(/memory access out of bounds|out of memory|RuntimeError|abort\(/i.test(msg))resetFFmpeg('中間影片製作時記憶體異常');
+    try{
+      if(ffmpeg?.engine===engine){
+        try{await engine.deleteFile(output)}catch(_){}
+        try{await engine.deleteFile(extraOutput)}catch(_){}
+        if(mounted)try{await engine.unmount(inputDir)}catch(_){}
+        if(written)try{await engine.deleteFile(source)}catch(_){}
+        try{await engine.deleteDir(inputDir)}catch(_){}
+        try{await engine.deleteDir(dir)}catch(_){}
+      }
+    }finally{if(ffmpeg?.engine===engine)resetFFmpeg('第一階段失敗，清除暫存')}
+    throw e;
+  }finally{engine.off('log',onLog)}
+}
+async function releaseIntermediate(group){
+  if(!group)return;
+  const {engine,dir,inputDir,source,mounted,written,path}=group;
+  if(ffmpeg?.engine!==engine)return;
+  try{
+    try{await engine.deleteFile(path)}catch(e){log('中間影片刪除警告：'+errorMessage(e))}
+    try{await engine.deleteFile(dir+'/intermediate_001.mp4')}catch(_){}
+    if(mounted)await engine.unmount(inputDir);
+    if(written)await engine.deleteFile(source);
+    await engine.deleteDir(inputDir);await engine.deleteDir(dir);
+  }catch(e){log('中間影片清理異常：'+errorMessage(e))}
+  finally{resetFFmpeg('已釋放第 '+group.name+' 份中間影片，避免手機記憶體累積')}
+}
+async function prepareNextLargeGroup(plan){
+  if(plan.pendingEnd!==null)throw Error('上一批仍待寄送，禁止提前分割下一個中間影片');
+  checkStop();
+  let group=null;
+  try{
+    group=await createIntermediate(plan);
+    checkStop();
+    status(`第二階段：將中間影片 ${plan.groupIndex+1}（${(group.size/MB).toFixed(1)}MiB）切成每片 <19MiB`);
+    const parts=await splitVideo({name:group.name,size:group.size},null,{path:group.path});
+    checkStop();
+    if(!parts.length||parts.some(p=>!p.validated||!p.blob||p.blob.size<MIN_VIDEO_BYTES||p.blob.size>MAX))
+      throw Error('第二階段存在無效附件，未完成驗證，禁止寄送');
+    const newItems=parts.map((part,i)=>({
+      ...part,
+      name:String(items.length+i+1).padStart(4,'0')+(part.name.match(/\.[^.]+$/)?.[0]||''),
+      size:part.blob.size
+    }));
+    // 先標記本批切割終點，再公開郵件佇列；只有全批 Gmail 成功，位置才正式前進。
+    plan.pendingEnd=group.end;
+    plan.groupIndex++;
+    items.push(...newItems);
+    prepared=true;
+    refresh();
+    status(`第 ${plan.groupIndex} 個中間影片已切成 ${newItems.length} 封。這批全部寄完才開始下一個中間影片`);
+  }finally{
+    await releaseIntermediate(group);
+  }
+}
+
 async function prepare() {
   if (running || batchRunning) return;
-  if(batchPlan){status('大型影片已建立分批作業；請按「開始寄送」處理已分割片段，避免重複分割');return;}
+  if(batchPlan){
+    if(batchPlan.pendingEnd!==null){status('本批附件已準備好，請按「開始寄送」，避免重複分割');return;}
+    if(items.some(x=>x.state!=='sent')){status('前一批仍有未寄出郵件，請先寄送或重試');return;}
+    setBusy(true);stopRequested=false;
+    try{await prepareNextLargeGroup(batchPlan)}catch(e){status('分批恢復失敗：'+errorMessage(e))}finally{setBusy(false);refresh()}
+    return;
+  }
   setBusy(true); stopRequested = false;
   const started = performance.now();
   try {
@@ -430,28 +646,9 @@ async function prepare() {
     const largeFiles=files.filter(f=>f.size>BATCH_THRESHOLD);
     log(`處理模式判斷：門檻 ${(BATCH_THRESHOLD/MB).toFixed(0)}MiB；`+files.map(f=>`${f.name} ${(f.size/MB).toFixed(2)}MiB`).join('、'));
     if(largeFiles.length){
-      if(files.length!==1) throw Error('超過 1 GB 的影片請一次選擇一部，完成後再選其他影片');
-      const file=files[0]; await checkReadable(file);
-      // 先建立分批計畫，不在「影片分割」階段把 1.6GB 全部展開至記憶體。
-      const groupCount=Math.max(2,Math.ceil(file.size/(600*MB)));
-      // 大區段只是進度規劃，不複製出數百 MB 中間檔；實際仍以 5 分鐘小批次處理。
-      batchPlan={file,position:0,window:300,pendingEnd:null,duration:null,done:false,groupCount,groupIndex:0};
-      prepared=false;
-      status(`影片超過 1 GB：規劃 ${groupCount} 個大區段；現在開始實際分割第一批約 5 分鐘影片`);
-      log('【第一批分割開始】正在執行 FFmpeg；此階段不會寄送 Gmail');
-      const parts=await splitVideo(file,{start:0,length:batchPlan.window});
-      checkStop();
-      if(!parts.length || parts.some(part=>!part.validated || !part.blob?.size || part.blob.size<MIN_VIDEO_BYTES || part.blob.size>MAX))throw Error('第一批沒有產生有效的 19MiB 以下附件');
-      if(!(batchPlan.duration>0))throw Error('無法取得影片總長度，已停止');
-      batchPlan.pendingEnd=Math.min(batchPlan.window,batchPlan.duration);
-      for(const part of parts){
-        part.name=String(items.length+1).padStart(4,'0')+(part.name.match(/\.[^.]+$/)?.[0]||'');
-        part.size=part.blob.size;
-        items.push(part);
-      }
-      prepared=true;
-      prepProgress.index=files.length;
-      refresh();
+      if(files.length!==1)throw Error('超過 1GB 的影片請先一次選擇一部，完成後再選其他影片');
+      const file=files[0];await checkReadable(file);
+      batchPlan={file,position:0,pendingEnd:null,duration:null,codec:null,done:false,groupIndex:0,groupEstimate:Math.ceil(file.size/GROUP_TARGET)};
       $('workProgress').textContent=`第一批分割完成｜${items.length} 個附件｜${((performance.now()-started)/1000).toFixed(1)} 秒`;
       status(`第一批已實際分割完成：${items.length} 個附件。按「開始寄送」將寄出本批，並自動逐批分割、寄送剩餘影片`);
       return;
@@ -476,7 +673,7 @@ async function prepare() {
       } else parts = await splitVideo(file);
       checkStop();
       for (const part of parts) {
-        if (part.blob.size > MAX) throw Error('附件超過 19MiB，已停止');
+        if(!part.validated||!part.blob||part.blob.size<MIN_VIDEO_BYTES||part.blob.size>MAX)throw Error('附件驗證不通過，禁止寄送');
         part.name = String(items.length+1).padStart(4,'0') + (part.name.match(/\.[^.]+$/)?.[0] || '');
         items.push(part);
       }
@@ -588,7 +785,8 @@ async function sendBatchQueue(){
       if(parts.some(part=>!part.blob?.size||part.blob.size<MIN_VIDEO_BYTES||part.blob.size>MAX||!part.validated))throw Error('分批片段為空或超過 19MiB，已停止');
       // The source duration is read by splitVideo; mark the end before sending.
       if(!(plan.duration>0))throw Error('無法取得原始影片總長度，已停止以避免重複片段');
-      plan.pendingEnd=Math.min(start+plan.window,plan.duration);
+      plan.pendingEnd=parts.actualEnd;
+      if(!(plan.pendingEnd>start))throw Error('分批沒有有效的進度邊界');
       for(const part of parts){
         part.name=String(items.length+1).padStart(4,'0')+(part.name.match(/\.[^.]+$/)?.[0]||'');
         part.size=part.blob.size;
@@ -605,7 +803,7 @@ async function sendBatchQueue(){
   finally{batchRunning=false;setBusy(false);refresh();}
 }
 $('send').onclick=sendBatchQueue;
-$('retry').onclick=async()=>{if(batchRunning)return;stopRequested=false;if(batchPlan&&!items.some(x=>x.state==='failed')){status('沒有失敗的郵件可重試；請按「開始寄送」繼續分割');return;}await sendQueue(true);if(batchPlan&&!running&&!items.some(x=>x.state!=='sent'))status('失敗片段已重試；按「開始寄送」繼續下一批')};
+$('retry').onclick=async()=>{if(batchRunning)return;stopRequested=false;if(batchPlan&&!items.some(x=>x.state==='failed')){status('沒有失敗的郵件可重試；請按「開始寄送」繼續分割');return;}await sendQueue(true);if(batchPlan&&!running&&!items.some(x=>x.state!=='sent'))status('郵件重試完成；按「開始寄送」繼續下一批')};
 $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new Date().toLocaleString('zh-TW')+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v448-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
