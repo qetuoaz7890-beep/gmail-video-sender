@@ -12,7 +12,7 @@
 <div id="checkpointHint" class="muted" aria-live="polite" style="margin-top:8px"></div>
 <button id="resumeSaved" class="secondary" disabled>恢復上次未完成工作</button><button id="clearSaved" class="warn">清除已存進度</button><button id="clearOrphans" class="secondary">清理舊暫存檔</button>
 <button class="secondary" id="resetTest">結束測試／返回正式模式</button>
-<button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="prepare">影片分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試</button><progress id="progress" max="100" value="0"></progress><div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div><div id="status" class="notice">正在自動檢查 FFmpeg 核心…</div></section>
+<button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="prepare">影片分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試</button><progress id="progress" max="100" value="0"></progress><div id="elapsedPanel" class="muted" aria-live="off" style="margin:9px 0;padding:10px 12px;border-radius:9px;background:#0d192d;line-height:1.6">累積處理時間：0秒｜目前階段：尚未開始</div><div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div><div id="status" class="notice">正在自動檢查 FFmpeg 核心…</div></section>
 <section class="panel"><h2>④ 安全續傳與結果確認</h2>
 <div class="muted">如果影片已寄送一部分、但更換程式後需要重新開始，可依舊紀錄填寫續傳起點。請只填「全部已確認寄出」的最後一批，不要把寄送結果不明的附件算進去。</div>
 <label for="resumeCount">先前已確認寄出的附件封數（新任務留白）</label><input id="resumeCount" type="number" min="0" step="1" placeholder="例如 15">
@@ -26,7 +26,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-23-capacity-safe-v10';
+const BUILD_TAG='2026-11-23-v10.3-continuous-mmss.1';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -231,21 +231,29 @@ const FAST_MP4 = (() => {
         if(as.length)choices.set(audio,as)}
       return choices;
     };
-    let selections=makeSelections(chosen);let size=0;
-    const calc=()=>[...selections.values()].flat().reduce((n,s)=>n+s.size,0);
-    size=calc();
-    while(size+index.moovBytes.length+128*1024>maxBytes && chosen.index>near.index+1){
+    let selections=makeSelections(chosen),size=0,moovDummy=null;
+    // Use EXACTLY the same assembled MP4 byte-count as planCut().
+    // Old code reserved original moov + 128KiB here, even though planCut()
+    // used the actual output moov. Near a capacity limit the two stages picked
+    // different keyframes, so a valid planned large group could fail to build.
+    const measure=()=>{
+      size=0;
+      for(const samples of selections.values())for(const sample of samples)size+=sample.size;
+      const zeros=new Map([...selections].map(([t,s])=>[t,s.map(()=>0)]));
+      moovDummy=makeMoov(index,selections,zeros);
+      return size+index.ftypBytes.length+moovDummy.length+8;
+    };
+    let assembledSize=measure();
+    while(assembledSize>=maxBytes && chosen.index>near.index+1){
       const prev=keys.filter(k=>k.index<chosen.index&&k.index>near.index).at(-1);
       if(!prev)throw Error('單個 GOP 大於安全中間檔容量，無法無損切割');
-      chosen=prev;selections=makeSelections(chosen);size=calc();
+      chosen=prev;selections=makeSelections(chosen);assembledSize=measure();
     }
-    if(size+index.moovBytes.length+128*1024>maxBytes)throw Error('單個 GOP 太大無法產生合格片段');
+    if(assembledSize>=maxBytes)throw Error('單個 GOP 太大無法產生合格片段');
     const all=[...selections.values()].flat().sort((x,y)=>x.ofs-y.ofs);
     const offsets=new Map([...selections.keys()].map(k=>[k,new Map()]));
     const videoSet=new Set(selections.get(video));
     let running=0;for(const s of all){const track=videoSet.has(s)?video:audio;offsets.get(track).set(s,running);running+=s.size}
-    const zero=new Map([...selections].map(([t,s])=>[t,s.map(()=>0)]));
-    const moovDummy=makeMoov(index,selections,zero);
     const base=index.ftypBytes.length+moovDummy.length+8;
     const real=new Map([...selections].map(([t,s])=>[t,s.map(x=>base+offsets.get(t).get(x))]));
     const moov=makeMoov(index,selections,real);
@@ -334,10 +342,44 @@ let token='',tokenClient=null,items=[],stopRequested=false,running=false,ffmpeg=
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
 function formatElapsed(rawSeconds){
   const seconds=Math.max(0,Math.floor(Number(rawSeconds)||0));
-  if(seconds<60)return `${seconds}秒`;
   const h=Math.floor(seconds/3600),m=Math.floor((seconds%3600)/60),s=seconds%60;
-  return (h?`${h}小時`:'')+(m?`${m}分鐘`:'')+(s?`${s}秒`:'');
+  const paddedSeconds=String(s).padStart(2,'0');
+  if(h>0)return `${h}小時${String(m).padStart(2,'0')}分${paddedSeconds}秒`;
+  if(m>0)return `${m}分${paddedSeconds}秒`;
+  return `${seconds}秒`;
 }
+// 與 FFmpeg、原生快切、Gmail 傳送相互獨立的「實際作業計時」；不依賴 workProgress 不會被狀態訊息蓋掉。
+const jobClock={totalMs:0,activeSince:null,everStarted:false,stage:'尚未開始',stageSince:null,stageMs:0};
+function clockRender(){
+  const now=performance.now(),live=jobClock.activeSince!==null;
+  const total=jobClock.totalMs+(live?now-jobClock.activeSince:0);
+  const stage=jobClock.stageMs+(live&&jobClock.stageSince!==null?now-jobClock.stageSince:0);
+  const suffix=live?'處理中':(jobClock.everStarted?'已暫停／等待操作':'尚未開始');
+  $('elapsedPanel').textContent=`累積處理時間：${formatElapsed(total/1000)}｜目前階段：${jobClock.stage}（${formatElapsed(stage/1000)}）｜${suffix}`;
+}
+function clockStage(label){
+  if(label!==jobClock.stage){
+    jobClock.stage=label;
+    jobClock.stageMs=0;
+    jobClock.stageSince=jobClock.activeSince===null?null:performance.now();
+  }
+  clockRender();
+}
+function clockStart(label){
+  const now=performance.now();
+  if(jobClock.activeSince===null){jobClock.activeSince=now;jobClock.everStarted=true;jobClock.stageSince=now;}
+  if(label)clockStage(label); else clockRender();
+}
+function clockPause(){
+  if(jobClock.activeSince!==null){
+    const now=performance.now();jobClock.totalMs+=now-jobClock.activeSince;
+    if(jobClock.stageSince!==null)jobClock.stageMs+=now-jobClock.stageSince;
+    jobClock.activeSince=null;jobClock.stageSince=null;
+  }
+  clockRender();
+}
+function clockReset(){jobClock.totalMs=0;jobClock.activeSince=null;jobClock.everStarted=false;jobClock.stage='尚未開始';jobClock.stageSince=null;jobClock.stageMs=0;clockRender();}
+setInterval(clockRender,1000);
 function log(s){const t=new Date().toLocaleTimeString('zh-TW',{hour12:false});logs.push(`[${t}] ${s}`);$('log').textContent=logs.slice(-120).join('\n');$('log').scrollTop=$('log').scrollHeight}
 function status(s){$('status').textContent=s;log(s)}
 function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=(sessionTestMode?'模擬 ':'')+success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${x.simulated?'僅模擬完成（未寄信）':x.state}${x.error?' ('+x.error+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
@@ -549,6 +591,7 @@ async function stabilizeLargeFile(file,{force=false}={}){
 let prepProgress = null, workMeter = null;
 function setBusy(value) {
   running = value;
+  if(value)clockStart();else if(!batchRunning)clockPause();
   for (const id of ['files','prepare','send','retry','testCore']) $(id).disabled = value || batchRunning;
   $('stop').disabled = false;
   $('dryRun').disabled = value || batchRunning || prepared || Boolean(batchPlan);
@@ -568,6 +611,7 @@ async function checkReadable(file) {
 $('dryRun').addEventListener('change',()=>{if(running||batchRunning||prepared||batchPlan){$('dryRun').checked=sessionTestMode;status('已有未完成工作；請先按「結束測試／返回正式模式」再切換');return;}testOutcome='';simulatedCount=0;testGroupHistory=[];refresh();status($('dryRun').checked?'已開啟本機測試模式：不會呼叫 Gmail 寄信':'已切回正常寄送模式');});
 $('resetTest').onclick=()=>{
   if(running||batchRunning){status('請先暫停並等待目前工作完成');return;}
+  clockReset();
   void cleanupStagedSources();
   ++selectionEpoch;inputCopies=new WeakMap();selectionReady=Promise.resolve();
   items=[];prepared=false;prepProgress=null;batchPlan=null;stopRequested=false;sessionTestMode=false;
@@ -1467,6 +1511,7 @@ async function releaseIntermediate(group){
 // V10: first stage creates ONLY a verifiable keyframe/byte-range plan.
 // No large intermediate Blob objects are retained while planning all groups.
 async function prepareAllLargeNativeGroups(plan){
+  clockStage('第一階段：大檔切點規劃');
   if(plan.file.size<=BATCH_THRESHOLD)return false;
   const ext=plan.file.name.split('.').pop().toLowerCase();
   if(!['mp4','mov','m4v'].includes(ext))return false;
@@ -1636,6 +1681,7 @@ async function preparePrecutGroup(plan){
   }
 }
 async function prepareNextLargeGroup(plan){
+  clockStage('第二階段：附件分割');
   if(plan.firstStageComplete)return await preparePrecutGroup(plan);
   if(plan.pendingEnd!==null)throw Error('上一批仍待寄送，禁止提前分割下一個中間影片');
   if(!Number.isFinite(plan.position)||plan.position<0||!Number.isSafeInteger(plan.groupIndex)||plan.groupIndex<0)throw Error('分批起點或編號不是有效數字，已安全停止');
@@ -1718,7 +1764,7 @@ async function prepare() {
     try{await prepareNextLargeGroup(batchPlan)}catch(e){status('分批恢復失敗：'+errorMessage(e))}finally{setBusy(false);refresh()}
     return;
   }
-  setBusy(true); stopRequested = false;
+  setBusy(true);clockStage('影片準備／讀取'); stopRequested = false;
   const started = performance.now();
   try {
     const files = Array.from($('files').files);
@@ -1807,6 +1853,7 @@ async function prepare() {
     $('progress').value = prepared ? 100 : 0;
   }
 }
+$('files').addEventListener('change',()=>{if(!running&&!batchRunning&&!prepared&&!batchPlan)clockReset();});
 $('prepare').onclick=prepare;$('stop').onclick=()=>{stopRequested=true;status('已要求暫停；等待目前操作完成…')};
 // Gmail 媒體上傳使用原始 RFC 822 MIME，不再對整封信做第二層 Base64URL。
 // 57 bytes = 76 個 Base64 字元，分組大小是 57 的整數倍以確保跨塊不插入額外填補位元。
@@ -1884,9 +1931,10 @@ async function sendOne(item,index){
   }
   return await res.json();
 }
+let adaptiveSendConcurrency=2,stableSendCount=0;
 async function sendQueue(failedOnly=false){
   if(running)return;
-  setBusy(true);
+  setBusy(true);clockStage('Gmail 寄送');
   try{
     if(sessionTestMode)throw Error('測試模式不得真實寄送 Gmail，請按「開始模擬」');
     if(!prepared)throw Error('請先完成影片準備');
@@ -1895,7 +1943,8 @@ async function sendQueue(failedOnly=false){
     if(!$('recipient').checkValidity()||!$('recipient').value.trim())throw Error('請輸入正確收件信箱');
     const targets=items.filter(x=>failedOnly?x.state==='failed':x.state==='ready'||x.state==='failed');
     if(!targets.length)throw Error('沒有可寄送附件');
-    const concurrency=2;
+    const concurrency=adaptiveSendConcurrency;
+    log('【智慧寄送】本輪同時寄送 '+concurrency+' 封；網路結果不明時暫降為單封，不會自動重寄狀態不明的附件');
     let cursor=0,haltReason='',active=0;
     const worker=async()=>{
       while(!stopRequested){
@@ -1905,12 +1954,14 @@ async function sendQueue(failedOnly=false){
         if(x.state!=='ready'&&x.state!=='failed')continue;
         x.state='sending';x.error='';active++;refresh();saveCheckpoint();
         const idx=items.indexOf(x);
-        status(`雙封加速：寄送第 ${idx+1}/${items.length} 段（同時進行 ${active} 封）`);
+        status(`智慧寄送：第 ${idx+1}/${items.length} 段（目前同時 ${active} 封／上限 ${concurrency} 封）`);
         const startTime=performance.now();
         try{
           const result=await sendOne(x,idx);
           x.state='sent';x.gmailId=result.id||'';x.error='';
           sentBytes+=x.blob.size; x.size=x.blob.size; x.blob=null;
+          stableSendCount++;
+          if(adaptiveSendConcurrency===1&&stableSendCount>=5){adaptiveSendConcurrency=2;stableSendCount=0;log('【智慧寄送】已連續成功 5 封；下一輪恢復雙封並行');}
           log(`寄送成功：${x.name} / ${formatElapsed((performance.now()-startTime)/1000)} / Gmail ID: ${x.gmailId}`);
           saveCheckpoint();
         }catch(e){
@@ -1919,6 +1970,9 @@ async function sendQueue(failedOnly=false){
           x.state=ambiguous?'uncertain':'failed';
           status('寄送異常：'+x.name+' — '+x.error);
           if(ambiguous){
+            adaptiveSendConcurrency=1;stableSendCount=0;
+            log('【智慧寄送降速】發生結果不明的網路錯誤；下輪先改為單封寄送，必須先人工確認這封是否寄出');
+            log('【網路診斷】online='+navigator.onLine+'；可見狀態='+document.visibilityState+'；封裝後花費='+formatElapsed((performance.now()-startTime)/1000));
             haltReason='網路結果不明：請先查 Gmail 已寄件匣，避免重複寄送';
             stopRequested=true;
           }else if(!token||/Gmail HTTP (401|403|429|5\d\d)\b/.test(x.error)){
@@ -1972,7 +2026,7 @@ async function sendBatchQueue(){
   const plan=batchPlan;
   if(!Number.isFinite(plan.position)||plan.position<0||!Number.isSafeInteger(plan.groupIndex)) {status('分批進度資料不合法，已安全停止，避免一次切整部影片');return;}
   // Lock selection for the entire batch operation, not only during sendQueue().
-  batchRunning=true;stopRequested=false;plan.autoSending=true;setBusy(false);saveCheckpoint();
+  batchRunning=true;stopRequested=false;plan.autoSending=true;setBusy(false);clockStart('Gmail 寄送');saveCheckpoint();
   const sendingStarted=performance.now();
   const sendingClock=plan.firstStageComplete?setInterval(()=>{
     $('workProgress').textContent=`第二階段 ${plan.groupIndex}/${plan.groups.length}｜寄送處理中｜已用 ${formatElapsed((performance.now()-sendingStarted)/1000)}`;
@@ -1986,7 +2040,7 @@ async function sendBatchQueue(){
       }
       if(unresolved.length){
         if(plan.firstStageComplete)status(`第二階段 ${plan.groupIndex}/${plan.groups.length} 開始寄送｜待寄 ${unresolved.length} 個附件`);
-        log(`【分批寄送】待寄 ${unresolved.length} 封，最多同時兩封`);
+        log(`【分批寄送】待寄 ${unresolved.length} 封，智慧並行上限 ${adaptiveSendConcurrency} 封`);
         if(plan.testMode)await simulateBatchQueue();else await sendQueue(false);
         if(stopRequested||items.some(x=>x.state!=='sent')){
           status('本批尚未全部寄送成功，已保留進度；重新授權後可按「開始寄送」續傳');break;
