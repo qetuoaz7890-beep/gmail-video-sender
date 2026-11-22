@@ -22,13 +22,15 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-21-two-stage-forced-dry-run-v3';
+const BUILD_TAG='2026-11-22-android-safe-batched-verification-v1';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 let tokenAcquiredAt=0;
 // 為避免 Android 同時建立多個數百 MiB 檔案，第一階段的實際中間檔一次只保留一份。
 const IS_ANDROID=/Android/i.test(navigator.userAgent);
 const GROUP_TARGET= (IS_ANDROID?240:500)*MB, GROUP_HARD_MAX=(IS_ANDROID?420:800)*MB;
 const TEST_GROUP_TARGET=75*MB, TEST_GROUP_HARD_MAX=115*MB, TEST_MIN_FILE=120*MB;
+// Android 同時只驗證兩段，避免多解碼器占用記憶體；HEVC 保守採原始逐段檢查。
+const VERIFY_BATCH_ANDROID=2,VERIFY_BATCH_DESKTOP=3;
 const targetFor=plan=>plan.testMode?TEST_GROUP_TARGET:GROUP_TARGET;
 const hardMaxFor=plan=>plan.testMode?TEST_GROUP_HARD_MAX:GROUP_HARD_MAX;
 let sessionTestMode=false, simulatedCount=0, testGroupHistory=[], testOutcome='';
@@ -231,6 +233,39 @@ async function validateSegment(engine,path,expectedMaxSeconds){
       throw Error('片段時長異常：'+seenDuration.toFixed(2)+' 秒');
   }finally{engine.off('log',observer)}
 }
+// 批次獨立解碼：一個 FFmpeg 命令各取每支片段的首張影格。
+// 任何片段缺少「可解碼首幀／有效時長」，立即退回原本逐片驗證，不會略過檢查。
+async function validateBatchSegments(engine, paths, expectedMaxSeconds){
+  if(paths.length<2)throw Error('片段數不足，使用逐段檢查');
+  const durations=Array(paths.length).fill(0), decoded=new Set();
+  let inputIndex=-1;
+  const observer=({message})=>{
+    const line=String(message);
+    const im=line.match(/^Input #(\d+),/);
+    if(im)inputIndex=Number(im[1]);
+    const dm=line.match(/Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)/);
+    if(dm&&inputIndex>=0&&inputIndex<paths.length)
+      durations[inputIndex]=Number(dm[1])*3600+Number(dm[2])*60+Number(dm[3]);
+    const fm=line.match(/Parsed_showinfo_(\d+).*?\bn:\s*0(?:\s|$)/);
+    if(fm)decoded.add(Number(fm[1]));
+  };
+  const graph=paths.map((_,i)=>`[${i}:v:0]showinfo[v${i}]`).join(';');
+  const args=['-hide_banner','-nostdin','-loglevel','info',
+    ...paths.flatMap(path=>['-i',path]),'-filter_complex',graph,
+    ...paths.flatMap((_,i)=>['-map',`[v${i}]`,'-frames:v','1','-an','-f','null','-'])];
+  engine.on('log',observer);
+  try{
+    const rc=await engine.exec(args);
+    if(rc!==0)throw Error('批次影格檢查回傳 '+rc);
+    for(let i=0;i<paths.length;i++){
+      if(!decoded.has(i)||!(durations[i]>0.05))
+        throw Error(`第 ${i+1} 段沒有可解碼首幀或有效時長`);
+      if(expectedMaxSeconds && durations[i]>expectedMaxSeconds+15)
+        throw Error(`第 ${i+1} 段影片時長異常`);
+    }
+    return true;
+  }finally{engine.off('log',observer)}
+}
 async function validateDirectBlob(blob,ext){
   const head=new Uint8Array(await blob.slice(0,Math.min(blob.size,65536)).arrayBuffer());
   // For small files, a header check alone must never be mistaken for a valid video.
@@ -321,16 +356,21 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
       if (v && !videoCodec && !message.includes('(attached pic)')) videoCodec = v[1];
       if (/Stream #0:.*Audio:/.test(message)) audioStreams++;
     };
-    engine.on('log', mediaInfo);
-    try {
-      // FFmpeg 0.12 rejects input-only commands with 'At least one output file must be specified'.
-      // A short stream-copy-to-null command has a real output, without decoding the full video.
-      const probeCode = await timed('讀取影片資訊', () => engine.exec([
-        '-hide_banner','-nostdin','-i',source,'-t','0.10',
-        '-map','0:v:0','-map','0:a?','-c','copy','-f','null','-'
-      ]));
-      if (probeCode !== 0) log('影片資訊探測結束碼：'+probeCode+'；'+messages.slice(-4).join(' | '));
-    } finally { engine.off('log', mediaInfo); }
+    if(virtualInput?.duration>0&&virtualInput?.codec){
+      // 第一階段已經檢查過影片資訊、完整時長與可解碼影格，直接重用結果。
+      duration=virtualInput.duration;videoCodec=virtualInput.codec;
+      log('第二階段重用已驗證影片資訊，省略重複 FFmpeg 探測');
+    }else{
+      engine.on('log', mediaInfo);
+      try {
+        // 非中間影片仍沿用原始檢查，不改變一般模式處理方式。
+        const probeCode = await timed('讀取影片資訊', () => engine.exec([
+          '-hide_banner','-nostdin','-i',source,'-t','0.10',
+          '-map','0:v:0','-map','0:a?','-c','copy','-f','null','-'
+        ]));
+        if (probeCode !== 0) log('影片資訊探測結束碼：'+probeCode+'；'+messages.slice(-4).join(' | '));
+      } finally { engine.off('log', mediaInfo); }
+    }
     if (!(duration > 0) || !videoCodec) throw Error('無法讀取影片時長或影像編碼；'+messages.slice(-6).join(' | '));
     log(`影片資訊：${duration.toFixed(2)} 秒／${videoCodec}／${audioStreams} 音軌`);
     if(windowRange&&batchPlan){batchPlan.duration=duration;if(windowRange.start>=duration)throw Error('已超過影片結尾');windowRange.length=Math.min(windowRange.length,duration-windowRange.start);log(`【分批切割】${windowRange.start.toFixed(2)}～${(windowRange.start+windowRange.length).toFixed(2)} 秒／總長 ${duration.toFixed(2)} 秒`);}
@@ -413,12 +453,12 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
     const result = [];
     let largest = 0, repaired = 0;
     // Only split an oversized fragment. Never restart the full original video.
-    const collect = async (path, level = 0) => {
+    const collect = async (path, level = 0, verified=false) => {
       checkStop();
       const data = await engine.readFile(path);
       validateContainerBytes(data,outExt,{allowOversize:true});
       if (data.byteLength <= MAX) {
-        await validateSegment(engine,path,windowRange?windowRange.length:Math.max(seconds*3,15));
+        if(!verified)await validateSegment(engine,path,windowRange?windowRange.length:Math.max(seconds*3,15));
         largest = Math.max(largest, data.byteLength);
         result.push({name:`part_${result.length+1}.${outExt}`,blob:new Blob([data],{type:mime}),state:'ready',validated:true});
         await engine.deleteFile(path);
@@ -440,7 +480,7 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
         if (splitCode !== 0) throw Error('局部分割失敗，原影片未重新處理');
         const subPaths = (await engine.listDir(subDir)).filter(e=>!e.isDir&&e.name.startsWith('part_')).map(e=>subDir+'/'+e.name).sort();
         if (subPaths.length < 2) throw Error('片段內沒有足夠的關鍵影格，無法安全地直接切成 19MiB 以下；已停止以避免畫面損壞');
-        for (const subPath of subPaths) await collect(subPath,level+1);
+        for (const subPath of subPaths) await collect(subPath,level+1,false);
         await engine.deleteFile(path);
       } finally {
         try {
@@ -449,12 +489,33 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
         } catch (_) {}
       }
     };
-    await timed('逐段檢查容量', async () => {
-      for (let i=0;i<paths.length;i++) {
-        phase = `檢查片段 ${i+1}/${paths.length}`;
-        await collect(paths[i]);
-        if (i%10===0 || i===paths.length-1) status(`檢查片段 ${i+1}/${paths.length}，已保留 ${result.length} 段`);
+    await timed('逐段檢查容量與畫面', async () => {
+      // 批次影格驗證能減少 FFmpeg 的啟動/收尾次數；HEVC Android 仍使用原流程。
+      const batchSize=IS_ANDROID?(videoCodec==='hevc'?1:VERIFY_BATCH_ANDROID):VERIFY_BATCH_DESKTOP;
+      const expected=windowRange?windowRange.length:Math.max(seconds*3,15);
+      let bulkPass=0,originalFallback=0;
+      for(let i=0;i<paths.length;i+=batchSize){
+        checkStop();
+        const group=paths.slice(i,i+batchSize);
+        let allValid=false;
+        if(group.length>1){
+          try {
+            allValid=await validateBatchSegments(engine,group,expected);
+            bulkPass+=group.length;
+          }catch(e){
+            if(/memory access out of bounds|out of memory|abort\(|RuntimeError/i.test(errorMessage(e)))throw e;
+            log('批次驗證無法確認所有片段，改用原本逐片驗證：'+errorMessage(e));
+          }
+        }
+        for(let j=0;j<group.length;j++){
+          phase=`檢查片段 ${i+j+1}/${paths.length}`;
+          if(!allValid)originalFallback++;
+          await collect(group[j],0,allValid);
+          if((i+j)%10===0 || i+j===paths.length-1)
+            status(`檢查片段 ${i+j+1}/${paths.length}，已保留 ${result.length} 段`);
+        }
       }
+      log(`【檢驗統計】批次解碼確認 ${bulkPass} 段；原始逐片驗證 ${originalFallback} 段（不含超標後續局部分割）`);
     });
     if(windowRange)result.actualEnd=windowRange.actualEnd;
     status(`已分割 ${file.name}：${result.length} 段，最大 ${(largest/MB).toFixed(2)}MiB，局部調整 ${repaired} 次，總耗時 ${((performance.now()-started)/1000).toFixed(1)} 秒`);
@@ -543,7 +604,11 @@ async function createIntermediate(plan) {
       }finally{engine.off('log',observer)}
     };
     if(start>0.10){
-      const keys=await meter('第一階段：確認上一批結尾關鍵影格',()=>findKeys(start,10,14));
+      let keys=await meter('第一階段：快速確認前批銜接',()=>findKeys(start,3,5));
+      if(!keys.some(t=>Math.abs(t-start)<0.14)){
+        log('短範圍未能確認切點，使用原本完整關鍵影格檢查');
+        keys=await meter('第一階段：確認上一批結尾關鍵影格',()=>findKeys(start,10,14));
+      }
       if(!keys.some(t=>Math.abs(t-start)<0.14))throw Error('無法驗證上一批終點與本批起點一致；禁止繼續以避免漏幀或重疊');
     }
     const remain=duration-start,ratio=file.size/duration;
@@ -556,8 +621,13 @@ async function createIntermediate(plan) {
       const planned=Math.min(duration,start+goal);
       end=duration;
       if(planned<duration-0.2){
-        const keys=await meter('第一階段：尋找可銜接的分割點',()=>findKeys(planned,12,42));
-        const choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
+        let keys=await meter('第一階段：快速尋找分割點',()=>findKeys(planned,6,12));
+        let choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
+        if(!choices.length){
+          log('短範圍沒有找到合格關鍵影格，恢復原本的大範圍掃描');
+          keys=await meter('第一階段：完整尋找分割點',()=>findKeys(planned,12,42));
+          choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
+        }
         if(!choices.length)throw Error('附近沒有可核對的關鍵影格，已安全停止，避免破圖／畫面重疊');
         // 以不超過預估位置的關鍵影格為優先，減少大區段容量突然超限的機會。
         const earlier=choices.filter(t=>t<=planned+0.05);
@@ -588,9 +658,14 @@ async function createIntermediate(plan) {
         // 切點後的小尾巴只用來安全 flush B-frames，不做為正式影片，下一批從同一關鍵影格接續。
         await engine.deleteFile(extraOutput);
       }
-      const raw=await meter('第一階段：檢查中間影片容量',()=>engine.readFile(output));
-      bytes=raw.byteLength;
-      if(bytes>=MIN_VIDEO_BYTES)validateContainerBytes(raw,'mp4',{allowOversize:true});
+      bytes=await meter('第一階段：檢查中間影片容量',async()=>{
+        // @ffmpeg/ffmpeg 0.12 的 listDir 不提供檔案大小；讀取後僅回傳數字，
+        // 讓數百 MiB 的檢驗副本儘早離開作用域，不會與第二階段長時間共存。
+        const bytesView=await engine.readFile(output);
+        const n=bytesView.byteLength;
+        if(n>=MIN_VIDEO_BYTES)validateContainerBytes(bytesView,'mp4',{allowOversize:true});
+        return n;
+      });
       // 不將 raw 轉成 Blob；保留 WASM FS 內的唯一一份實體中間檔供第二階段讀取。
       if(bytes>=MIN_VIDEO_BYTES&&bytes<hardMaxFor(plan)&&bytes<BATCH_THRESHOLD){
         await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
@@ -646,7 +721,7 @@ async function prepareNextLargeGroup(plan){
     group=await createIntermediate(plan);
     checkStop();
     status(`第二階段：將中間影片 ${plan.groupIndex+1}（${(group.size/MB).toFixed(1)}MiB）切成每片 <19MiB`);
-    const parts=await splitVideo({name:group.name,size:group.size},null,{path:group.path});
+    const parts=await splitVideo({name:group.name,size:group.size},null,{path:group.path,duration:group.end-group.start,codec:plan.codec});
     checkStop();
     if(!Number.isFinite(group.end)||group.end<=plan.position)throw Error('中間影片的結尾時間無效（NaN），禁止寄送或跳過');
     if(!parts.length||parts.some(p=>!p.validated||!p.blob||p.blob.size<MIN_VIDEO_BYTES||p.blob.size>MAX))
