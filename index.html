@@ -26,7 +26,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-23-v10.3-continuous-mmss.1';
+const BUILD_TAG='2026-11-23-v10.4-tail-timeline-repair.1';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -764,6 +764,93 @@ async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration
   if(!matched)throw Error('最後一批結尾畫面與原片近結尾時間點不一致，停止避免漏掉最後畫面');
   log('【尾段畫面核對】結尾：原片約 '+anchor.toFixed(3)+' 秒（容許時間偏移 '+offset.toFixed(2)+' 秒），解碼畫面相同');
 }
+// V10.4: MP4 多段 edit list 的最後尾段不能只用 input -ss 加 -c copy。
+// 某些 Android 錄影檔會把上一個 GOP (常見約 2 秒) 帶入 MP4 時長。
+// 優先在離尾端 6 秒的位置作輸入定位，然後使用輸出側 -ss 精準丟棄前導；
+// 失敗才切換其他不重新編碼的方式。每個候選都要通過容量、解碼、時長、首尾畫面核對。
+// 不得直接把多出的 2 秒當成合法誤差，也不得只改 Duration 標籤。
+async function cutAndVerifyLastIntermediate(engine,dir,source,start,length,totalDuration,hardMax,meter){
+  const seekAt=Math.max(0,start-6), relativeStart=start-seekAt;
+  const output=dir+'/intermediate_000.mp4';
+  const segOutput=dir+'/intermediate_001.mp4';
+  const pattern=dir+'/intermediate_%03d.mp4';
+  const shared=['-map','0:V:0','-map','0:a?','-c','copy'];
+  const trials=[
+    {name:'前導定位＋輸出側精準切點',path:output,args:[
+      '-ss',seekAt.toFixed(3),'-i',source,'-ss',relativeStart.toFixed(3),
+      '-t',length.toFixed(3),...shared,'-avoid_negative_ts','make_zero',
+      '-use_editlist','0','-y',output]},
+    {name:'關鍵影格快切＋停用輸出 edit list',path:output,args:[
+      '-ss',start.toFixed(3),'-i',source,'-t',length.toFixed(3),
+      ...shared,'-avoid_negative_ts','make_zero',
+      '-use_editlist','0','-y',output]},
+    {name:'前導分段＋停用輸出 edit list',path:segOutput,args:[
+      '-ss',seekAt.toFixed(3),'-i',source,
+      '-t',(relativeStart+length+0.25).toFixed(3),...shared,
+      '-f','segment','-reference_stream','v:0',
+      '-segment_times',relativeStart.toFixed(3),'-segment_time_delta','0.04',
+      '-reset_timestamps','1','-segment_format_options','use_editlist=0',
+      '-y',pattern]},
+    {name:'前導定位＋相容時間軸備援',path:output,args:[
+      '-ss',seekAt.toFixed(3),'-i',source,'-ss',relativeStart.toFixed(3),
+      '-t',length.toFixed(3),...shared,'-avoid_negative_ts','make_zero',
+      '-y',output]},
+    // 最後才從原片頭掃到尾端，避免一般情況白白重讀大型影片。
+    {name:'全片輸出側精準尋址（較慢備援）',path:output,args:[
+      '-i',source,'-ss',start.toFixed(3),'-t',length.toFixed(3),
+      ...shared,'-avoid_negative_ts','make_zero',
+      '-use_editlist','0','-y',output]}
+  ];
+  const clear=async()=>{
+    const files=await engine.listDir(dir);
+    for(const f of files){
+      if(!f.isDir&&/^intermediate_\d{3}\.mp4$/.test(f.name))
+        try{await engine.deleteFile(dir+'/'+f.name)}catch(_){}
+    }
+  };
+  let lastError=null;
+  for(let i=0;i<trials.length;i++){
+    checkStop();
+    const trial=trials[i];
+    await clear();
+    log(`【尾段時間軸修復 ${i+1}/${trials.length}】${trial.name}；預期 ${length.toFixed(3)} 秒`);
+    try{
+      const result=await meter('第一階段：尾段精準切割',()=>engine.exec([
+        '-hide_banner','-nostdin',...trial.args]),length+6);
+      if(result!==0)throw Error('FFmpeg 回傳 '+result);
+      const entries=await engine.listDir(dir);
+      if(!entries.some(e=>!e.isDir&&e.name===trial.path.split('/').at(-1)))
+        throw Error('找不到尾段輸出檔');
+      const bytes=await meter('第一階段：檢查尾段容量',async()=>{
+        const b=await engine.readFile(trial.path),size=b.byteLength;
+        if(size>=MIN_VIDEO_BYTES)validateContainerBytes(b,'mp4',{allowOversize:true});
+        return size;
+      });
+      if(bytes<MIN_VIDEO_BYTES||bytes>=hardMax||bytes>=BATCH_THRESHOLD)
+        throw Error('尾段大小超出有效或安全容量：'+(bytes/MB).toFixed(2)+' MiB');
+      const checked=await meter('第一階段：核對尾段實際秒數',()=>validateSegment(engine,trial.path,length+15));
+      const diff=checked.duration-length;
+      if(Math.abs(diff)>0.45)throw Error('預期 '+length.toFixed(2)+' 秒／實際 '+checked.duration.toFixed(2)+' 秒（差 '+diff.toFixed(2)+' 秒）');
+      await meter('第一階段：核對尾段首尾影格',()=>auditTailFrames(
+        engine,dir,source,trial.path,start,length,totalDuration));
+      // Segment 輸出可能還留下前導區；只有驗證過的檔案會交給第二階段。
+      for(const entry of await engine.listDir(dir)){
+        if(!entry.isDir&&/^intermediate_\d{3}\.mp4$/.test(entry.name)&&
+            entry.name!==trial.path.split('/').at(-1))
+          try{await engine.deleteFile(dir+'/'+entry.name)}catch(_){}
+      }
+      log(`【尾段時間軸修復成功】採 ${trial.name}，${checked.duration.toFixed(2)} 秒，${(bytes/MB).toFixed(2)}MiB，首尾畫面已核對`);
+      return {path:trial.path,bytes};
+    }catch(error){
+      lastError=error;
+      const msg=errorMessage(error);
+      log(`【尾段候選未通過 ${i+1}/${trials.length}】${msg}；不保留這個結果`);
+      await clear();
+      if(/memory access out of bounds|out of memory|RuntimeError|abort\(/i.test(msg))throw error;
+    }
+  }
+  throw Error('最後尾段已嘗試 '+trials.length+' 種免重編碼方案，仍無法通過真實秒數及影格核對。為避免重複或漏影格已安全停止。最後錯誤：'+errorMessage(lastError));
+}
 // 批次獨立解碼：一個 FFmpeg 命令各取每支片段的首張影格。
 // 任何片段缺少「可解碼首幀／有效時長」，立即退回原本逐片驗證，不會略過檢查。
 async function validateBatchSegments(engine, paths, expectedMaxSeconds){
@@ -1390,18 +1477,22 @@ async function createIntermediate(plan) {
       // 最後一批改用直接 stream-copy，並以首/尾解碼畫面嚴格核對來源。
       const hasNext=end<duration-0.10;
       const withPreroll=start>0.10;
-      const finalDirect=!hasNext&&withPreroll;
+      // 最後一批採多種無損切法逐一試算；只接受時長正確且首尾影格吻合的結果。
+      // 前面已通過的非尾段仍沿用原本分段方式，避免破壞既有正常功能。
+      if(!hasNext&&withPreroll){
+        const repaired=await cutAndVerifyLastIntermediate(
+          engine,dir,source,start,length,duration,hardMaxFor(plan),meter);
+        output=repaired.path;bytes=repaired.bytes;
+        plan.lastVerifiedBoundary=end;
+        success=true;
+        log(`【中間影片完成】第 ${plan.groupIndex+1} 份，${(bytes/MB).toFixed(2)}MiB（小於 1GB），尾段精準核對完成，進入第二階段`);
+        break;
+      }
       const seekAt=withPreroll?Math.max(0,start-6):0;
       const relStart=start-seekAt, relEnd=end-seekAt;
       const flushTail=hasNext?Math.min(2,Math.max(0,duration-end)):0;
       let cutArgs;
-      if(finalDirect){
-        output=dir+'/intermediate_000.mp4';
-        log('【最後一批專用快切】不再使用前導 segment；直接以已驗證的 '+start.toFixed(3)+' 秒關鍵影格擷取到原片結尾，之後雙點核對來源畫面');
-        cutArgs=['-ss',start.toFixed(3),'-i',source,
-          '-t',length.toFixed(3),'-map','0:V:0','-map','0:a?',
-          '-c','copy','-avoid_negative_ts','make_zero','-y',output];
-      }else if(!hasNext&&!withPreroll){
+      if(!hasNext&&!withPreroll){
         // 單段涵蓋全片時，不需要建立假尾段。
         cutArgs=['-ss','0.000','-i',source,'-t',length.toFixed(3),
           '-map','0:V:0','-map','0:a?','-c','copy',
@@ -1423,9 +1514,9 @@ async function createIntermediate(plan) {
           '-y',dir+'/intermediate_%03d.mp4'
         ];
       }
-      const rc=await meter('第一階段：實際建立中間影片',()=>engine.exec(['-hide_banner','-nostdin',...cutArgs]),finalDirect?length:relEnd+flushTail);
+      const rc=await meter('第一階段：實際建立中間影片',()=>engine.exec(['-hide_banner','-nostdin',...cutArgs]),relEnd+flushTail);
       if(rc!==0)throw Error('中間影片製作失敗：'+lastLines.slice(-4).join(' | '));
-      if(!finalDirect&&(hasNext||withPreroll)){
+      if(hasNext||withPreroll){
         const entries=await engine.listDir(dir);
         const names=entries.filter(x=>!x.isDir).map(x=>x.name);
         const keptName=output.split('/').at(-1);
@@ -1453,13 +1544,9 @@ async function createIntermediate(plan) {
       // 不將 raw 轉成 Blob；保留 WASM FS 內的唯一一份實體中間檔供第二階段讀取。
       if(bytes>=MIN_VIDEO_BYTES&&bytes<hardMaxFor(plan)&&bytes<BATCH_THRESHOLD){
         const checked=await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
-        const tolerance=finalDirect?0.45:(hasNext?Math.max(0.65,Math.min(1.5,length*0.025)):1.5);
+        const tolerance=hasNext?Math.max(0.65,Math.min(1.5,length*0.025)):1.5;
         if(Math.abs(checked.duration-length)>tolerance)
           throw Error(`切割時長不一致：預期 ${length.toFixed(2)} 秒／實際 ${checked.duration.toFixed(2)} 秒；停止避免接縫缺幀`);
-        if(finalDirect){
-          await meter('第一階段：最後一批首尾畫面逐點核對',()=>auditTailFrames(engine,dir,source,output,start,length,duration));
-          log('【最後一批安全完成】時長誤差 '+Math.abs(checked.duration-length).toFixed(3)+' 秒，首尾畫面與原片一致，才允許進入第二階段');
-        }
         plan.lastVerifiedBoundary=end;
         success=true;log(`【中間影片完成】第 ${plan.groupIndex+1} 份，${(bytes/MB).toFixed(2)}MiB（小於 1GB），進入第二階段；接下來不製作其他大區段`);
         break;
