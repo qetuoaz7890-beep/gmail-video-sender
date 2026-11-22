@@ -22,7 +22,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-22-tail-boundary-audit-v7';
+const BUILD_TAG='2026-11-23-file-access-stability-v8';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -339,6 +339,70 @@ function errorMessage(error) {
   return 'FFmpeg 未回傳錯誤內容';
 }
 let inputCopies = new WeakMap(), selectionReady = Promise.resolve(), selectionEpoch = 0;
+// V8 Android local file-reference stability: Stream a durable copy into Origin Private File System
+// rather than retaining an ephemeral Files/Photos picker reference across long operations.
+// OPFS is browser-local storage, never a remote upload. Chunks bound JS memory usage.
+const STAGE_PREFIX='bulk_sender_stable_v8_';
+const stageRecords=new Map();
+async function cleanupStagedSources(){
+  const records=Array.from(stageRecords.values());stageRecords.clear();
+  for(const record of records){
+    try { await record.root.removeEntry(record.name);log('已清除手機暫存影片：'+record.name); }
+    catch(e){log('暫存影片稍後需由瀏覽器清理：'+errorMessage(e));}
+  }
+}
+async function stabilizeLargeFile(file){
+  if(!IS_ANDROID||file.size<=96*MB||inputCopies.has(file))return;
+  // No surprise RAM copy: only try disk-based chunked copy when sufficient browser quota exists.
+  if(!navigator.storage?.getDirectory){log('瀏覽器沒有 OPFS 支援，維持 V7 原始讀取路徑；請從「檔案／下載」選影片');return;}
+  let estimate;
+  try{estimate=await navigator.storage.estimate()}catch(e){log('瀏覽器暫存配額無法查詢：'+errorMessage(e));return;}
+  const free=Number(estimate?.quota)-Number(estimate?.usage);
+  if(!Number.isFinite(free)||free<file.size+48*MB){
+    log(`本機暫存空間不足：需要約 ${(file.size/MB).toFixed(0)}MiB，瀏覽器可用約 ${Number.isFinite(free)?(Math.max(0,free)/MB).toFixed(0):'未知'}MiB；沿用原始檔案路徑`);
+    return;
+  }
+  const name=STAGE_PREFIX+Date.now()+'_'+Math.random().toString(36).slice(2,10)+'_'+(file.name.toLowerCase().match(/\.(mp4|mov|m4v|webm|mkv)$/)?.[0]||'.mp4');
+  let root=null,handle=null,writable=null;
+  const step=8*MB,start=performance.now();
+  try{
+    status('建立穩定的手機本機影片副本（不會上傳網路）…');
+    root=await navigator.storage.getDirectory();
+    handle=await root.getFileHandle(name,{create:true});
+    writable=await handle.createWritable();
+    log(`【Android 檔案讀取修正】採用 OPFS 分塊複製 ${(file.size/MB).toFixed(1)}MiB，避免 FFmpeg 反覆讀取相簿暫存參照`);
+    for(let offset=0;offset<file.size;offset+=step){
+      checkStop();
+      const end=Math.min(file.size,offset+step);
+      let bytes;
+      try{bytes=await file.slice(offset,end).arrayBuffer()}
+      catch(e){throw fileReadError(file,e)}
+      if(bytes.byteLength!==end-offset)throw fileReadError(file,Error('本機複製取得的資料不完整'));
+      await writable.write(bytes);
+      if(offset===0||end===file.size||Math.floor(end/(64*MB))!==Math.floor(offset/(64*MB))){
+        $('workProgress').textContent=`本機檔案穩定化｜${(100*end/file.size).toFixed(0)}%｜已複製 ${(end/MB).toFixed(0)} / ${(file.size/MB).toFixed(0)}MiB`;
+      }
+      bytes=null;
+      if((offset/step)%8===0)await sleep(0);
+    }
+    checkStop();
+    await writable.close();writable=null;
+    const snapshot=await handle.getFile();
+    if(snapshot.size!==file.size)throw Error('本機影片副本容量與原檔不一致');
+    await checkReadable(snapshot);
+    inputCopies.set(file,snapshot);
+    stageRecords.set(file,{root,name});
+    log(`【穩定副本完成】${(snapshot.size/MB).toFixed(1)}MiB，耗時 ${((performance.now()-start)/1000).toFixed(1)} 秒；後續原生切割與 FFmpeg 均改讀同一份本機副本`);
+  }catch(e){
+    if(writable){try{await writable.abort()}catch(_){}}
+    if(root&&handle){try{await root.removeEntry(name)}catch(_){}}
+    if(stopRequested)throw e;
+    if(/NotReadableError|FileReaderSync|無法讀取|not be read|permission|讀取不完整/i.test(errorMessage(e)))throw fileReadError(file,e);
+    log('建立 OPFS 本機副本失敗，改回原始影片：'+errorMessage(e));
+    status('本機穩定副本不可用，將嘗試原始影片；若仍失敗，請選手機「下載」內的本地檔案');
+  }
+}
+
 let prepProgress = null, workMeter = null;
 function setBusy(value) {
   running = value;
@@ -361,6 +425,7 @@ async function checkReadable(file) {
 $('dryRun').addEventListener('change',()=>{if(running||batchRunning||prepared||batchPlan){$('dryRun').checked=sessionTestMode;status('已有未完成工作；請先按「結束測試／返回正式模式」再切換');return;}testOutcome='';simulatedCount=0;testGroupHistory=[];refresh();status($('dryRun').checked?'已開啟本機測試模式：不會呼叫 Gmail 寄信':'已切回正常寄送模式');});
 $('resetTest').onclick=()=>{
   if(running||batchRunning){status('請先暫停並等待目前工作完成');return;}
+  void cleanupStagedSources();
   ++selectionEpoch;inputCopies=new WeakMap();selectionReady=Promise.resolve();
   items=[];prepared=false;prepProgress=null;batchPlan=null;stopRequested=false;sessionTestMode=false;
   simulatedCount=0;testGroupHistory=[];testOutcome='';sentBytes=0;
@@ -369,6 +434,7 @@ $('resetTest').onclick=()=>{
 };
 $('files').addEventListener('change', () => {
   if(batchRunning){status('分批寄送中，請勿更換影片');return;}
+  void cleanupStagedSources();
   const epoch = ++selectionEpoch, files = Array.from($('files').files);
   inputCopies = new WeakMap(); items = []; prepared = false; prepProgress = null; batchPlan = null; stopRequested = false; sessionTestMode=false; simulatedCount=0; testGroupHistory=[]; testOutcome="";
   refresh(); status(`已選取 ${files.length} 部影片，正在檢查讀取…`);
@@ -1396,7 +1462,7 @@ async function prepare() {
     log(`處理模式判斷：${sessionTestMode?'強制兩階段安全測試':'正常門檻 '+(BATCH_THRESHOLD/MB).toFixed(0)+'MiB'}；`+files.map(f=>`${f.name} ${(f.size/MB).toFixed(2)}MiB`).join('、'));
     if(largeFiles.length){
       if(files.length!==1)throw Error('兩階段分割請先一次選擇一部，完成後再選其他影片');
-      const file=files[0];await checkReadable(file);
+      const file=files[0];await checkReadable(file);await stabilizeLargeFile(file);checkStop();
       const countText=$('resumeCount').value.trim(),secText=$('resumeSec').value.trim();
       if(Boolean(countText)!==Boolean(secText))throw Error('續傳設定必須同時填寫「已寄封數」和「完成秒數」，或兩欄都留白');
       const prevCount=countText?Number(countText):0,prevSeconds=secText?Number(secText):0;
@@ -1420,7 +1486,7 @@ async function prepare() {
     log('【一般模式】影片未超過 1GB，沿用原本的完整分割流程');
     for (let i = 0; i < files.length; i++) {
       checkStop(); prepProgress.index = i;
-      const file = files[i], input = inputCopies.get(file) || file;
+      const file = files[i]; await stabilizeLargeFile(file); checkStop(); const input = inputCopies.get(file) || file;
       status(`處理 ${i+1}/${files.length}：${file.name}`);
       let parts;
       if (file.size <= MAX) {
@@ -1579,6 +1645,7 @@ async function sendQueue(failedOnly=false){
     if(haltReason)status(haltReason);
     else if(stopRequested)status('已暫停；已啟動的郵件已完成，未寄項目保留');
     else status('本輪處理結束；已確認成功 '+items.filter(x=>x.state==='sent').length+' / '+items.length+' 段');
+    if(!batchPlan && items.length && items.every(x=>x.state==='sent'))await cleanupStagedSources();
   }catch(e){status(e?.message||String(e))}
   finally{setBusy(false);refresh()}
 }
@@ -1656,6 +1723,7 @@ async function sendBatchQueue(){
         status(testOutcome);
       }else status(`【大型影片全部完成】${plan.groupIndex} 個中間影片全部已依序分割並寄送，已確認 ${items.filter(x=>x.state==='sent').length} 封`);
       batchPlan=null;
+      await cleanupStagedSources();
     }else if(stopRequested){status('【分批已暫停】進度已保留在此分頁，請勿重新整理');}
   }catch(e){status('【分批模式停止】'+errorMessage(e));}
   finally{batchRunning=false;setBusy(false);refresh();}
@@ -1679,7 +1747,7 @@ $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
-  log(`程式版本：${BUILD_TAG}；安全前導切割＋Android 自適應批次＋Gmail 媒體直傳；正式 >1GB 兩階段；安全測試絕不寄信`);
+  log(`程式版本：${BUILD_TAG}；Android 大檔 OPFS 分塊穩定副本＋安全前導切割＋雙封並行；測試模式絕不寄信`);
   log(`【批次容量設定】手機記憶體回報 ${REPORTED_DEVICE_MEMORY||'不支援'}GiB；正式目標 ${(GROUP_TARGET/MB).toFixed(0)}MiB，測試目標 ${(TEST_GROUP_TARGET/MB).toFixed(0)}MiB，硬上限不變`);
   loadFFmpeg().catch(error=>{log('自動檢查失敗，可按「檢查 FFmpeg 核心」重試：'+errorMessage(error));});
 },{once:true});
