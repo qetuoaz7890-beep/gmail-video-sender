@@ -22,7 +22,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-22-android-safe-batched-verification-v1';
+const BUILD_TAG='2026-11-22-android-indexed-boundary-v2';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 let tokenAcquiredAt=0;
 // 為避免 Android 同時建立多個數百 MiB 檔案，第一階段的實際中間檔一次只保留一份。
@@ -231,6 +231,7 @@ async function validateSegment(engine,path,expectedMaxSeconds){
       throw Error('片段沒有可解碼的影格或有效時長，禁止寄送');
     if(expectedMaxSeconds && seenDuration>expectedMaxSeconds+15)
       throw Error('片段時長異常：'+seenDuration.toFixed(2)+' 秒');
+    return {duration:seenDuration,decodedFrames};
   }finally{engine.off('log',observer)}
 }
 // 批次獨立解碼：一個 FFmpeg 命令各取每支片段的首張影格。
@@ -358,7 +359,7 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
     };
     if(virtualInput?.duration>0&&virtualInput?.codec){
       // 第一階段已經檢查過影片資訊、完整時長與可解碼影格，直接重用結果。
-      duration=virtualInput.duration;videoCodec=virtualInput.codec;
+      duration=virtualInput.duration;videoCodec=virtualInput.codec;audioStreams=virtualInput.audioStreams||0;
       log('第二階段重用已驗證影片資訊，省略重複 FFmpeg 探測');
     }else{
       engine.on('log', mediaInfo);
@@ -540,6 +541,142 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
     if ((failedCleanup||engineCorrupted||windowRange) && ffmpeg?.engine === engine) resetFFmpeg(engineCorrupted?'WASM 記憶體異常':failedCleanup?'暫存清理異常':'完成大型影片小批次');
   }
 }
+// 純瀏覽器 MP4/MOV 關鍵影格索引：只讀取 moov（通常數百 KiB 到幾 MiB），
+// 不掃描 1GB 級 mdat，也不將整個來源拷貝進 WASM 記憶體。
+// 僅在首批 FFmpeg 真實影格掃描與索引吻合後啟用；任何不支援的結構都退回既有安全掃描。
+async function readFastMp4Index(file){
+  const fail=reason=>{log('【快速索引】不採用：'+reason+'；沿用 FFmpeg 原有安全掃描');return null;};
+  if(!file||file.size<MIN_VIDEO_BYTES) return fail('檔案不完整');
+  const dv32=(v,p)=>v.getUint32(p,false);
+  const str4=(v,p)=>String.fromCharCode(v.getUint8(p),v.getUint8(p+1),v.getUint8(p+2),v.getUint8(p+3));
+  const uint64=(v,p)=>{const n=v.getBigUint64(p,false);return n>BigInt(Number.MAX_SAFE_INTEGER)?NaN:Number(n);};
+  const boxes=(view,start,end)=>{
+    const result=[];let pos=start,steps=0;
+    while(pos+8<=end&&++steps<250000){
+      const size32=dv32(view,pos),name=str4(view,pos+4);
+      let size=size32,header=8;
+      if(size32===1){if(pos+16>end)throw Error('64 位箱體標頭不完整');size=uint64(view,pos+8);header=16;}
+      if(size32===0)size=end-pos;
+      if(!Number.isSafeInteger(size)||size<header||pos+size>end)throw Error('MP4 箱體大小異常：'+name);
+      result.push({name,at:pos+header,end:pos+size,size});pos+=size;
+    }
+    if(pos!==end)throw Error('MP4 箱體未完整對齊');return result;
+  };
+  const child=(v,box,name)=>boxes(v,box.at,box.end).find(b=>b.name===name);
+  try {
+    // 檢查頂層箱體：僅讀少量頭部，跨過巨大的 mdat；避免整片載入手機 RAM。
+    let cursor=0,moovOffset=-1,moovSize=0,ftyp=false;
+    for(let n=0;n<25000&&cursor+8<=file.size;n++){
+      checkStop();
+      const head=new DataView(await file.slice(cursor,Math.min(file.size,cursor+16)).arrayBuffer());
+      if(head.byteLength<8)break;
+      const name=str4(head,4),small=dv32(head,0);
+      let length=small;
+      if(small===1){if(head.byteLength<16)break;length=uint64(head,8);}
+      if(small===0)length=file.size-cursor;
+      if(!Number.isSafeInteger(length)||length<8||cursor+length>file.size)break;
+      if(name==='ftyp')ftyp=true;
+      if(name==='moov'){moovOffset=cursor;moovSize=length;break;}
+      cursor+=length;
+    }
+    if(!ftyp||moovOffset<0)return fail('找不到標準 MP4 moov/ftyp');
+    if(moovSize>48*MB)return fail('影片索引超過 48MiB 的安全上限');
+    const buffer=await file.slice(moovOffset,moovOffset+moovSize).arrayBuffer();
+    if(buffer.byteLength!==moovSize)return fail('索引讀取不完整');
+    const v=new DataView(buffer);
+    const root=boxes(v,0,buffer.byteLength);
+    const moov=root.find(b=>b.name==='moov');
+    if(!moov)return fail('moov 解析失敗');
+    if(child(v,moov,'mvex'))return fail('分段型 MP4 不支援快速索引');
+    const tracks=boxes(v,moov.at,moov.end).filter(b=>b.name==='trak');
+    let selected=null;
+    for(const trak of tracks){
+      const mdia=child(v,trak,'mdia');if(!mdia)continue;
+      const hdlr=child(v,mdia,'hdlr');if(!hdlr||hdlr.at+12>hdlr.end||str4(v,hdlr.at+8)!=='vide')continue;
+      if(selected)return fail('多影像軌先沿用原本的切割流程');
+      selected={trak,mdia};
+    }
+    if(!selected)return fail('找不到標準影像軌');
+    const mdhd=child(v,selected.mdia,'mdhd');
+    const minf=child(v,selected.mdia,'minf');
+    const stbl=minf&&child(v,minf,'stbl');
+    const stts=stbl&&child(v,stbl,'stts'),stss=stbl&&child(v,stbl,'stss'),ctts=stbl&&child(v,stbl,'ctts');
+    if(!mdhd||!stts||!stss)return fail('缺少影格時間表或關鍵影格表');
+    const tsPosition=mdhd.at+(v.getUint8(mdhd.at)===1?20:12);
+    if(tsPosition+4>mdhd.end)return fail('時間軸資訊不完整');
+    const timescale=dv32(v,tsPosition);
+    if(!(timescale>0))return fail('時間刻度不正確');
+    const parseRuns=(box,signed=false)=>{
+      if(!box)return null;
+      const version=v.getUint8(box.at),count=dv32(v,box.at+4);
+      if(count>250000||box.at+8+count*8>box.end)throw Error('時間表異常');
+      const result=[];for(let i=0;i<count;i++){
+        const at=box.at+8+i*8;
+        result.push([dv32(v,at),signed&&version===1?v.getInt32(at+4,false):dv32(v,at+4)]);
+      }
+      return result;
+    };
+    const decodeRuns=parseRuns(stts),compositionRuns=parseRuns(ctts,true);
+    const sampleCount=decodeRuns.reduce((a,r)=>a+r[0],0);
+    if(!Number.isSafeInteger(sampleCount)||sampleCount<2||sampleCount>2000000)return fail('影格數量超出安全範圍');
+    const syncCount=dv32(v,stss.at+4);
+    if(syncCount<2||syncCount>100000||stss.at+8+syncCount*4>stss.end)return fail('關鍵影格表超出安全範圍');
+    const syncs=[];
+    for(let i=0;i<syncCount;i++){const index=dv32(v,stss.at+8+i*4);if(index<1||index>sampleCount)return fail('關鍵影格序號不正確');syncs.push(index);}
+    // 只支援單段 edit list；複雜變速、前導空白時仍走原本 FFmpeg 路徑。
+    let editSeconds=0;
+    const edts=child(v,selected.trak,'edts'),elst=edts&&child(v,edts,'elst');
+    if(elst){
+      const version=v.getUint8(elst.at),count=dv32(v,elst.at+4),pos=elst.at+8;
+      if(count!==1||version>1)return fail('影片使用複雜編輯時間表');
+      const mediaTime=version===1?Number(v.getBigInt64(pos+8,false)):v.getInt32(pos+4,false);
+      const rateOffset=pos+(version===1?16:8);
+      if(mediaTime<0||rateOffset+4>elst.end||v.getInt16(rateOffset,false)!==1||v.getInt16(rateOffset+2,false)!==0)return fail('影片編輯時間軸不適合快速索引');
+      editSeconds=mediaTime/timescale;
+    }
+    // 按 stts/ctts 逐段線性前進，不解碼影片，也不配置逐影格巨型物件。
+    let sample=1,decode=0,di=0,dr=decodeRuns[0][0],ci=0,cr=compositionRuns?compositionRuns[0][0]:0;
+    const times=[];
+    for(const target of syncs){
+      while(sample<target){
+        if(dr<=0){di++;if(di>=decodeRuns.length)throw Error('stts 表提前結束');dr=decodeRuns[di][0];continue;}
+        let move=Math.min(target-sample,dr);
+        decode+=move*decodeRuns[di][1];sample+=move;dr-=move;
+        if(compositionRuns){
+          while(move>0){if(cr<=0){ci++;if(ci>=compositionRuns.length)throw Error('ctts 表提前結束');cr=compositionRuns[ci][0];continue;}
+            const used=Math.min(move,cr);cr-=used;move-=used;}
+        }
+      }
+      if(compositionRuns){while(cr===0){ci++;if(ci>=compositionRuns.length)throw Error('ctts 表提前結束');cr=compositionRuns[ci][0];}}
+      const t=(decode+(compositionRuns?compositionRuns[ci][1]:0))/timescale-editSeconds;
+      if(Number.isFinite(t)&&t>=-0.1)times.push(Math.max(0,t));
+    }
+    // MP4 時戳會由第一批 FFmpeg 探測校準；在此之前不直接用索引決定任何切點。
+    if(times.length<2||times.some((t,i)=>i>0&&t<times[i-1]))return fail('關鍵影格時間軸異常');
+    log(`【快速索引】只讀取 ${(moovSize/MB).toFixed(2)}MiB moov，找到 ${times.length} 個關鍵影格，等待首批 FFmpeg 校準`);
+    return {times,shift:0,trusted:false};
+  } catch(error){
+    if(stopRequested)throw error;
+    return fail(errorMessage(error));
+  }
+}
+function indexKeysNear(index,at,behind=10,ahead=30){
+  if(!index?.trusted)return [];
+  const low=Math.max(0,at-behind),high=at+ahead;
+  return index.times.map(t=>t+index.shift).filter(t=>t>=low&&t<=high);
+}
+function calibrateFastIndex(index,observed,at){
+  if(!index||index.trusted||!observed.length)return;
+  const real=observed.reduce((a,b)=>Math.abs(a-at)<=Math.abs(b-at)?a:b);
+  const near=index.times.reduce((a,b)=>Math.abs(a-real)<=Math.abs(b-real)?a:b);
+  const delta=real-near;
+  if(Math.abs(delta)>0.16){log('【快速索引】首批 FFmpeg 時間與 MP4 索引相差 '+delta.toFixed(3)+' 秒，保持原本掃描');return;}
+  // 要求多個不同關鍵影格吻合；可避免碰巧選到附近但錯誤的時間表。
+  const matches=observed.filter(t=>index.times.some(k=>Math.abs(k+delta-t)<0.09));
+  if(matches.length<Math.min(2,observed.length)){log('【快速索引】首批參考影格不足，保持原本掃描');return;}
+  index.shift=delta;index.trusted=true;
+  log(`【快速索引已校準】校正差 ${delta.toFixed(3)} 秒；後續批次以 MP4 索引找切點，減少重複掃描`);
+}
 // 實體大區段：先以不重新編碼的方式將原片擷取成 <1GB 的可播放影片；
 // 下一階段只處理這一份中間檔，全部郵件寄送成功後才會建立下一份。
 async function createIntermediate(plan) {
@@ -575,6 +712,7 @@ async function createIntermediate(plan) {
         if(m)duration=Number(m[1])*3600+Number(m[2])*60+Number(m[3]);
         const v=t.match(/Stream #\d+:\d+(?:\[[^\]]+\])?(?:\([^)]*\))*[^\n]*?Video:\s*([\w-]+)/i);
         if(v&&!videoCodec&&!t.includes('(attached pic)'))videoCodec=v[1];
+        if(/Stream #0:\d+.*Audio:/i.test(t))plan.audioStreams=Math.max(1,plan.audioStreams||0);
       };
       engine.on('log',info);
       try{
@@ -587,6 +725,10 @@ async function createIntermediate(plan) {
     }
     if(!['h264','hevc'].includes(videoCodec)||!['mp4','m4v','mov'].includes(ext))
       throw Error(`大型影片 ${videoCodec}/${ext} 無法安全免重編碼切成實體中間影片，已停止；不會寄送損壞片段`);
+    if(!plan.keyIndexAttempted){
+      plan.keyIndexAttempted=true;
+      plan.keyIndex=await meter('第一階段：建立快速影片索引',()=>readFastMp4Index(input));
+    }
     const start=plan.position;
     if(start>=duration-0.10)throw Error('影片已到結尾，不需要建立下一份中間檔');
     // 除第一個邊界以外，每個起點都必須是上一份使用的同一關鍵影格時間點。
@@ -604,12 +746,18 @@ async function createIntermediate(plan) {
       }finally{engine.off('log',observer)}
     };
     if(start>0.10){
-      let keys=await meter('第一階段：快速確認前批銜接',()=>findKeys(start,3,5));
-      if(!keys.some(t=>Math.abs(t-start)<0.14)){
-        log('短範圍未能確認切點，使用原本完整關鍵影格檢查');
-        keys=await meter('第一階段：確認上一批結尾關鍵影格',()=>findKeys(start,10,14));
+      if(Number.isFinite(plan.lastVerifiedBoundary) && Math.abs(plan.lastVerifiedBoundary-start)<0.005){
+        log('【銜接免重掃】本批起點沿用上一批已核對的相同影格邊界 '+start.toFixed(3)+' 秒');
+      }else{
+        let keys=indexKeysNear(plan.keyIndex,start,3,5);
+        if(keys.some(t=>Math.abs(t-start)<0.09))log('【快速索引】已確認手動續傳起點的關鍵影格');
+        else keys=await meter('第一階段：快速確認前批銜接',()=>findKeys(start,3,5));
+        if(!keys.some(t=>Math.abs(t-start)<0.14)){
+          log('短範圍未能確認切點，使用原本完整關鍵影格檢查');
+          keys=await meter('第一階段：確認上一批結尾關鍵影格',()=>findKeys(start,10,14));
+        }
+        if(!keys.some(t=>Math.abs(t-start)<0.14))throw Error('無法驗證上一批終點與本批起點一致；禁止繼續以避免漏幀或重疊');
       }
-      if(!keys.some(t=>Math.abs(t-start)<0.14))throw Error('無法驗證上一批終點與本批起點一致；禁止繼續以避免漏幀或重疊');
     }
     const remain=duration-start,ratio=file.size/duration;
     // 用原始影片平均位元率估時，實際輸出大小必須再驗證，超限就縮短時間重試。
@@ -621,11 +769,17 @@ async function createIntermediate(plan) {
       const planned=Math.min(duration,start+goal);
       end=duration;
       if(planned<duration-0.2){
-        let keys=await meter('第一階段：快速尋找分割點',()=>findKeys(planned,6,12));
+        let keys=indexKeysNear(plan.keyIndex,planned,6,12);
+        if(keys.length)log('【快速索引命中】以已校準 MP4 關鍵影格選擇切點，省去 FFmpeg 重新掃描');
+        else{
+          keys=await meter('第一階段：快速尋找分割點',()=>findKeys(planned,6,12));
+          calibrateFastIndex(plan.keyIndex,keys,planned);
+        }
         let choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
         if(!choices.length){
           log('短範圍沒有找到合格關鍵影格，恢復原本的大範圍掃描');
           keys=await meter('第一階段：完整尋找分割點',()=>findKeys(planned,12,42));
+          calibrateFastIndex(plan.keyIndex,keys,planned);
           choices=keys.filter(t=>t>start+0.10&&t<=planned+35&&t>=Math.max(start+0.1,planned-12));
         }
         if(!choices.length)throw Error('附近沒有可核對的關鍵影格，已安全停止，避免破圖／畫面重疊');
@@ -668,7 +822,10 @@ async function createIntermediate(plan) {
       });
       // 不將 raw 轉成 Blob；保留 WASM FS 內的唯一一份實體中間檔供第二階段讀取。
       if(bytes>=MIN_VIDEO_BYTES&&bytes<hardMaxFor(plan)&&bytes<BATCH_THRESHOLD){
-        await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
+        const checked=await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
+        if(plan.keyIndex?.trusted && Math.abs(checked.duration-length)>Math.max(1.2,Math.min(2.5,length*0.04)))
+          throw Error(`快速索引切割時長不一致：預期 ${length.toFixed(2)} 秒／實際 ${checked.duration.toFixed(2)} 秒；停止避免接縫缺幀`);
+        plan.lastVerifiedBoundary=end;
         success=true;log(`【中間影片完成】第 ${plan.groupIndex+1} 份，${(bytes/MB).toFixed(2)}MiB（小於 1GB），進入第二階段；接下來不製作其他大區段`);
         break;
       }
@@ -721,7 +878,7 @@ async function prepareNextLargeGroup(plan){
     group=await createIntermediate(plan);
     checkStop();
     status(`第二階段：將中間影片 ${plan.groupIndex+1}（${(group.size/MB).toFixed(1)}MiB）切成每片 <19MiB`);
-    const parts=await splitVideo({name:group.name,size:group.size},null,{path:group.path,duration:group.end-group.start,codec:plan.codec});
+    const parts=await splitVideo({name:group.name,size:group.size},null,{path:group.path,duration:group.end-group.start,codec:plan.codec,audioStreams:plan.audioStreams||0});
     checkStop();
     if(!Number.isFinite(group.end)||group.end<=plan.position)throw Error('中間影片的結尾時間無效（NaN），禁止寄送或跳過');
     if(!parts.length||parts.some(p=>!p.validated||!p.blob||p.blob.size<MIN_VIDEO_BYTES||p.blob.size>MAX))
@@ -976,7 +1133,7 @@ $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
-  log(`程式版本：${BUILD_TAG}；正式模式 >1GB 兩階段處理；測試模式 120MiB～1GB 真切割、僅本機模擬、不寄 Gmail`);
+  log(`程式版本：${BUILD_TAG}；首批 FFmpeg 校準＋後續 MP4 快速索引（不適用則自動退回安全掃描）；正式 >1GB 兩階段；測試僅模擬不寄信`);
   loadFFmpeg().catch(error=>{log('自動檢查失敗，可按「檢查 FFmpeg 核心」重試：'+errorMessage(error));});
 },{once:true});
 </script></body></html>
