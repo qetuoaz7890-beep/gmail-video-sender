@@ -22,7 +22,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-22-android-indexed-boundary-v2';
+const BUILD_TAG='2026-11-22-android-fast-packet-index-v3';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 let tokenAcquiredAt=0;
 // 為避免 Android 同時建立多個數百 MiB 檔案，第一階段的實際中間檔一次只保留一份。
@@ -543,7 +543,7 @@ async function splitVideo(file, windowRange = null, virtualInput = null) {
 }
 // 純瀏覽器 MP4/MOV 關鍵影格索引：只讀取 moov（通常數百 KiB 到幾 MiB），
 // 不掃描 1GB 級 mdat，也不將整個來源拷貝進 WASM 記憶體。
-// 僅在首批 FFmpeg 真實影格掃描與索引吻合後啟用；任何不支援的結構都退回既有安全掃描。
+// 僅在 FFmpeg 真實封包／影格抽查與索引吻合後啟用；不支援的結構退回既有安全掃描。
 async function readFastMp4Index(file){
   const fail=reason=>{log('【快速索引】不採用：'+reason+'；沿用 FFmpeg 原有安全掃描');return null;};
   if(!file||file.size<MIN_VIDEO_BYTES) return fail('檔案不完整');
@@ -651,7 +651,7 @@ async function readFastMp4Index(file){
       const t=(decode+(compositionRuns?compositionRuns[ci][1]:0))/timescale-editSeconds;
       if(Number.isFinite(t)&&t>=-0.1)times.push(Math.max(0,t));
     }
-    // MP4 時戳會由第一批 FFmpeg 探測校準；在此之前不直接用索引決定任何切點。
+    // MP4 時戳須經 FFmpeg 封包或影格校準；在此之前不直接用索引決定任何切點。
     if(times.length<2||times.some((t,i)=>i>0&&t<times[i-1]))return fail('關鍵影格時間軸異常');
     log(`【快速索引】只讀取 ${(moovSize/MB).toFixed(2)}MiB moov，找到 ${times.length} 個關鍵影格，等待首批 FFmpeg 校準`);
     return {times,shift:0,trusted:false};
@@ -676,6 +676,61 @@ function calibrateFastIndex(index,observed,at){
   if(matches.length<Math.min(2,observed.length)){log('【快速索引】首批參考影格不足，保持原本掃描');return;}
   index.shift=delta;index.trusted=true;
   log(`【快速索引已校準】校正差 ${delta.toFixed(3)} 秒；後續批次以 MP4 索引找切點，減少重複掃描`);
+}
+// V3 快速驗證：MP4 moov/stss 只提供候選值，不能直接視為可靠切點。
+// 使用 FFmpeg 的 -debug_ts + stream copy，在來源的兩個不同位置各讀一個資料包，
+// 核對第一個影片封包時間戳。與掃描幾十秒關鍵影格相比，此路徑不用逐幀解碼。
+// 任何時間不吻合、格式差異或無 debug_ts 輸出時，完全退回 V2 的解碼掃描。
+async function verifyFastIndexWithPackets(engine, source, index, planned, duration) {
+  if(!index || index.trusted)return !!index?.trusted;
+  const eligible=index.times.filter(t=>t>=1 && t<duration-0.75 && t<=planned+1);
+  if(eligible.length<2){log('【快速封包抽查】關鍵影格不足，沿用安全解碼掃描');return false;}
+  const right=eligible[eligible.length-1];
+  const left=eligible.filter(t=>t<right-3).at(-1);
+  if(!Number.isFinite(left)){log('【快速封包抽查】沒有兩個獨立切點，沿用安全解碼掃描');return false;}
+  const offsets=[];
+  for(const candidate of [left,right]){
+    checkStop();
+    let found=null;
+    const observer=({message})=>{
+      if(found!==null)return;
+      const line=String(message);
+      if(!line.includes('demuxer ->')||!line.includes('type:video'))return;
+      const match=line.match(/\bpkt_pts_time:\s*(-?\d+(?:\.\d+)?)/);
+      if(match)found=Number(match[1]);
+    };
+    engine.on('log',observer);
+    try{
+      // Seek 稍晚於候選關鍵影格，讓 demuxer 落在該 key packet（僅複製，不解碼）。
+      // -copyts 讓 debug_ts 使用來源時間軸，避免將每次 seek 重設為 0。
+      const rc=await engine.exec(['-hide_banner','-nostdin','-loglevel','info','-debug_ts',
+        '-ss',(candidate+0.07).toFixed(3),'-copyts','-i',source,
+        '-map','0:V:0','-an','-c','copy','-frames:v','1','-f','null','-']);
+      if(rc!==0||!Number.isFinite(found)){
+        log(`【快速封包抽查】無法讀取 ${candidate.toFixed(3)} 秒附近的封包時間，回退安全掃描`);
+        return false;
+      }
+      const shift=found-candidate;
+      if(Math.abs(shift)>0.14){
+        log(`【快速封包抽查】來源時間戳不吻合（偏移 ${shift.toFixed(3)} 秒），回退安全掃描`);
+        return false;
+      }
+      offsets.push(shift);
+    }catch(error){
+      const detail=errorMessage(error);
+      if(/memory access out of bounds|out of memory|abort\(|RuntimeError/i.test(detail))throw error;
+      log('【快速封包抽查】不支援此封包探測：'+detail+'；改用安全掃描');
+      return false;
+    }finally{engine.off('log',observer)}
+  }
+  if(Math.abs(offsets[0]-offsets[1])>0.07){
+    log('【快速封包抽查】兩個位置的時間偏移不一致，回退安全掃描');
+    return false;
+  }
+  index.shift=(offsets[0]+offsets[1])/2;
+  index.trusted=true;
+  log(`【快速封包索引已驗證】FFmpeg 封包 ${left.toFixed(3)} / ${right.toFixed(3)} 秒均吻合，校正 ${index.shift.toFixed(3)} 秒；後續直接查表找邊界`);
+  return true;
 }
 // 實體大區段：先以不重新編碼的方式將原片擷取成 <1GB 的可播放影片；
 // 下一階段只處理這一份中間檔，全部郵件寄送成功後才會建立下一份。
@@ -731,6 +786,14 @@ async function createIntermediate(plan) {
     }
     const start=plan.position;
     if(start>=duration-0.10)throw Error('影片已到結尾，不需要建立下一份中間檔');
+    // 首次使用快速索引時，只抽查兩個封包的來源時間戳；失敗保留完整掃描回退。
+    // 每批的真實中間影片仍需做可解碼畫面與容量驗證，不省略最後安全關卡。
+    if(plan.keyIndex&&!plan.keyIndex.trusted&&!plan.fastPacketProbeAttempted){
+      plan.fastPacketProbeAttempted=true;
+      const estimatedGoal=Math.min(duration-start,targetFor(plan)/(file.size/duration)*0.90);
+      const probeAt=Math.min(duration-0.1,start+estimatedGoal);
+      await meter('第一階段：雙點快速封包校驗',()=>verifyFastIndexWithPackets(engine,source,plan.keyIndex,probeAt,duration));
+    }
     // 除第一個邊界以外，每個起點都必須是上一份使用的同一關鍵影格時間點。
     const findKeys=async(at,behind=10,ahead=30)=>{
       const scanStart=Math.max(0,at-behind),len=Math.min(duration-scanStart,behind+ahead);
@@ -1133,7 +1196,7 @@ $('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n'+new
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
-  log(`程式版本：${BUILD_TAG}；首批 FFmpeg 校準＋後續 MP4 快速索引（不適用則自動退回安全掃描）；正式 >1GB 兩階段；測試僅模擬不寄信`);
+  log(`程式版本：${BUILD_TAG}；首批雙點封包校驗＋後續 MP4 快速索引（不適用則自動退回安全掃描）；正式 >1GB 兩階段；測試僅模擬不寄信`);
   loadFFmpeg().catch(error=>{log('自動檢查失敗，可按「檢查 FFmpeg 核心」重試：'+errorMessage(error));});
 },{once:true});
 </script></body></html>
