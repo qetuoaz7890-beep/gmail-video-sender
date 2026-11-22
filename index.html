@@ -22,7 +22,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-22-native-mp4-sample-remux-v6';
+const BUILD_TAG='2026-11-22-tail-boundary-audit-v7';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -471,6 +471,45 @@ async function validateSegment(engine,path,expectedMaxSeconds){
       throw Error('片段時長異常：'+seenDuration.toFixed(2)+' 秒');
     return {duration:seenDuration,decodedFrames};
   }finally{engine.off('log',observer)}
+}
+// V7: 尾段會碰到 MP4 edit list / Input -ss / segment 的時間軸差異。
+// 比對來源與最後中間檔在「同一絕對位置」的實際解碼像素，而非只相信 MP4 Duration。
+// 只產生 64x64 灰階原始畫面（4096 bytes）；無重編碼，也不寫入大畫面。
+async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration){
+  const firstTarget=0, lateTarget=Math.max(0.05,length-Math.min(0.65,length/2));
+  const grab=async(path,at,tag)=>{
+    checkStop();
+    const out=dir+'/audit_'+tag+'.raw';
+    try{
+      const args=['-hide_banner','-nostdin','-loglevel','error',
+        ...(at>0.001?['-ss',at.toFixed(3)]:[]),'-i',path,
+        '-map','0:V:0','-frames:v','1','-an',
+        '-vf','scale=64:64,format=gray','-f','rawvideo','-y',out];
+      const rc=await engine.exec(args);
+      if(rc!==0)throw Error('無法讀取用於尾段比對的解碼畫面（'+tag+'，錯誤碼 '+rc+'）');
+      const data=await engine.readFile(out);
+      if(data.byteLength!==4096)throw Error('尾段畫面比對資料不完整：'+tag);
+      return data;
+    }finally{try{await engine.deleteFile(out)}catch(_){}}
+  };
+  const equal=(a,b)=>a.byteLength===b.byteLength&&a.every((v,i)=>v===b[i]);
+  // 首影格不得回到上一批；近尾影格必須對應同一來源時刻。
+  const expectedStart=await grab(source,start,'source_start');
+  const actualStart=await grab(tail,firstTarget,'tail_start');
+  if(!equal(expectedStart,actualStart))throw Error('最後一批開頭不是原片預定關鍵影格，停止避免重複或缺幀');
+  log('【尾段畫面核對】開頭：原片 '+start.toFixed(3)+' 秒，解碼畫面相同');
+  // MP4 有 AAC priming/edit list 時，重新封裝的起始 PTS 可能有數十毫秒偏移。
+  // 末端容許 ±0.16s 的取樣時間差，仍嚴禁 2 秒錯位。
+  const actualEnd=await grab(tail,lateTarget,'tail_end');
+  const anchor=Math.min(totalDuration-0.05,start+lateTarget);
+  let matched=false,offset=0;
+  for(const deviation of [0,-0.04,-0.08,-0.12,-0.16,0.04,0.08,0.12,0.16]){
+    const t=Math.min(totalDuration-0.10,Math.max(start+Math.min(0.02,length/4),anchor+deviation));
+    const expected=await grab(source,t,'source_end');
+    if(equal(expected,actualEnd)){matched=true;offset=deviation;break;}
+  }
+  if(!matched)throw Error('最後一批結尾畫面與原片近結尾時間點不一致，停止避免漏掉最後畫面');
+  log('【尾段畫面核對】結尾：原片約 '+anchor.toFixed(3)+' 秒（容許時間偏移 '+offset.toFixed(2)+' 秒），解碼畫面相同');
 }
 // 批次獨立解碼：一個 FFmpeg 命令各取每支片段的首張影格。
 // 任何片段缺少「可解碼首幀／有效時長」，立即退回原本逐片驗證，不會略過檢查。
@@ -1092,33 +1131,38 @@ async function createIntermediate(plan) {
       if(!(end>start+0.05))throw Error('第一階段的大區段時間邊界無效');
       const length=end-start;
       log(`【中間檔 ${plan.groupIndex+1}】原片 ${start.toFixed(3)}～${end.toFixed(3)} 秒；無重新編碼複製，目標 <${(hardMaxFor(plan)/MB).toFixed(0)}MiB`);
-      // V4: 對第二批及後續批次使用「前導緩衝 + segment 真切點」。
-      // FFmpeg 在 -ss INPUT + -c copy 時可能落到較早的 DTS 關鍵影格，
-      // 若直接把切出的第一份當正式批次，就可能把上一批末尾重複帶入。
-      // 因此先從起點前 6 秒進行快速 seek，真正的批次放在第二個分段；
-      // 前導分段永不進入寄送佇列。首批從 0 開始，沿用已通過的原有路徑。
+      // V7: 最後一批沒有下一個關鍵影格可作 segment 右邊界。
+      // 舊版「-ss 前導 + segment_times 只有起點」會將 seek 的編輯清單位移
+      // 帶入尾段，造成最後一份在 222.097～238.040 秒多出約 2 秒。
+      // 最後一批改用直接 stream-copy，並以首/尾解碼畫面嚴格核對來源。
       const hasNext=end<duration-0.10;
       const withPreroll=start>0.10;
+      const finalDirect=!hasNext&&withPreroll;
       const seekAt=withPreroll?Math.max(0,start-6):0;
       const relStart=start-seekAt, relEnd=end-seekAt;
       const flushTail=hasNext?Math.min(2,Math.max(0,duration-end)):0;
       let cutArgs;
-      if(!hasNext&&!withPreroll){
+      if(finalDirect){
+        output=dir+'/intermediate_000.mp4';
+        log('【最後一批專用快切】不再使用前導 segment；直接以已驗證的 '+start.toFixed(3)+' 秒關鍵影格擷取到原片結尾，之後雙點核對來源畫面');
+        cutArgs=['-ss',start.toFixed(3),'-i',source,
+          '-t',length.toFixed(3),'-map','0:V:0','-map','0:a?',
+          '-c','copy','-avoid_negative_ts','make_zero','-y',output];
+      }else if(!hasNext&&!withPreroll){
         // 單段涵蓋全片時，不需要建立假尾段。
         cutArgs=['-ss','0.000','-i',source,'-t',length.toFixed(3),
           '-map','0:V:0','-map','0:a?','-c','copy',
           '-avoid_negative_ts','make_zero','-y',output];
       }else{
-        const cutPoints=withPreroll
-          ?(hasNext?[relStart,relEnd]:[relStart])
-          :[length];
+        // 非末批仍保留 V6 已成功通過 7 批測試的前導 + 真實 segment 邊界。
+        const cutPoints=withPreroll?[relStart,relEnd]:[length];
         output=dir+(withPreroll?'/intermediate_001.mp4':'/intermediate_000.mp4');
         if(withPreroll){
           log(`【銜接防重疊】先讀 ${seekAt.toFixed(3)}～${start.toFixed(3)} 秒作前導，丟棄 intermediate_000；正式只保留 intermediate_001`);
         }
         cutArgs=[
           '-ss',seekAt.toFixed(3),'-i',source,
-          '-t',(relEnd+flushTail+(hasNext?0:0.15)).toFixed(3),
+          '-t',(relEnd+flushTail).toFixed(3),
           '-map','0:V:0','-map','0:a?','-c','copy',
           '-f','segment','-reference_stream','v:0',
           '-segment_times',cutPoints.map(x=>x.toFixed(3)).join(','),
@@ -1126,9 +1170,9 @@ async function createIntermediate(plan) {
           '-y',dir+'/intermediate_%03d.mp4'
         ];
       }
-      const rc=await meter('第一階段：實際建立中間影片',()=>engine.exec(['-hide_banner','-nostdin',...cutArgs]),relEnd+flushTail);
+      const rc=await meter('第一階段：實際建立中間影片',()=>engine.exec(['-hide_banner','-nostdin',...cutArgs]),finalDirect?length:relEnd+flushTail);
       if(rc!==0)throw Error('中間影片製作失敗：'+lastLines.slice(-4).join(' | '));
-      if(hasNext||withPreroll){
+      if(!finalDirect&&(hasNext||withPreroll)){
         const entries=await engine.listDir(dir);
         const names=entries.filter(x=>!x.isDir).map(x=>x.name);
         const keptName=output.split('/').at(-1);
@@ -1156,8 +1200,13 @@ async function createIntermediate(plan) {
       // 不將 raw 轉成 Blob；保留 WASM FS 內的唯一一份實體中間檔供第二階段讀取。
       if(bytes>=MIN_VIDEO_BYTES&&bytes<hardMaxFor(plan)&&bytes<BATCH_THRESHOLD){
         const checked=await meter('第一階段：驗證中間影片畫面',()=>validateSegment(engine,output,length+15));
-        if(Math.abs(checked.duration-length)>(hasNext?Math.max(0.65,Math.min(1.5,length*0.025)):1.5))
-          throw Error(`快速索引切割時長不一致：預期 ${length.toFixed(2)} 秒／實際 ${checked.duration.toFixed(2)} 秒；停止避免接縫缺幀`);
+        const tolerance=finalDirect?0.45:(hasNext?Math.max(0.65,Math.min(1.5,length*0.025)):1.5);
+        if(Math.abs(checked.duration-length)>tolerance)
+          throw Error(`切割時長不一致：預期 ${length.toFixed(2)} 秒／實際 ${checked.duration.toFixed(2)} 秒；停止避免接縫缺幀`);
+        if(finalDirect){
+          await meter('第一階段：最後一批首尾畫面逐點核對',()=>auditTailFrames(engine,dir,source,output,start,length,duration));
+          log('【最後一批安全完成】時長誤差 '+Math.abs(checked.duration-length).toFixed(3)+' 秒，首尾畫面與原片一致，才允許進入第二階段');
+        }
         plan.lastVerifiedBoundary=end;
         success=true;log(`【中間影片完成】第 ${plan.groupIndex+1} 份，${(bytes/MB).toFixed(2)}MiB（小於 1GB），進入第二階段；接下來不製作其他大區段`);
         break;
