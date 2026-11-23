@@ -26,7 +26,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-23-v10.9-tail-packet-audit.1';
+const BUILD_TAG='2026-11-23-v10.10-audio-packet-tail.1';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -970,7 +970,7 @@ async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration
   if(!matched)throw Error('最後一批結尾畫面與原片近結尾時間點不一致，停止避免漏掉最後畫面');
   log('【尾段畫面核對】結尾：原片約 '+anchor.toFixed(3)+' 秒（容許時間偏移 '+offset.toFixed(2)+' 秒），解碼畫面相同');
 }
-// V10.9: 尾段是 -c copy 時，可直接核對「來源關鍵影格起點 + 到片尾所有視訊封包原始位元組」。
+// V10.10: 尾段是 -c copy 時，可直接核對「來源關鍵影格起點 + 到片尾所有視訊封包原始位元組」。
 // 不對大型來源反覆 FFmpeg -ss/解碼；每次僅讀取來源 4MiB 視窗，資料不傳網路。
 // 前提：來源的視訊單段 edit list、既有雙點 FFmpeg 關鍵影格索引已通過校準。
 // 遇到不支援、任何封包不符或取消，絕不宣稱通過；外層退回原本完整像素比對。
@@ -988,6 +988,9 @@ async function auditTailCopyPackets(engine,sourceFile,tail,start,totalDuration,v
   const sv=sourceIndex.video,tv=tailIndex.video;
   if(sv.format!==tv.format||Boolean(sourceIndex.audio)!==Boolean(tailIndex.audio))
     throw Error('尾段影音軌結構與來源不同');
+  if(sourceIndex.audio && (sourceIndex.audio.format!==tailIndex.audio.format ||
+     sourceIndex.audio.scale!==tailIndex.audio.scale))
+    throw Error('尾段音訊編碼或時間刻度與來源不同');
   const sourceKeys=sv.samples.filter(x=>x.rap);
   if(sourceKeys.length!==verifiedKeys.times.length)
     throw Error('來源關鍵影格數與已校準切點表不同');
@@ -1013,30 +1016,62 @@ async function auditTailCopyPackets(engine,sourceFile,tail,start,totalDuration,v
   const lastTime=(last.dts+last.cts-sv.videoEditTime)/sv.scale+verifiedKeys.shift;
   if(!Number.isFinite(lastTime)||lastTime<totalDuration-1.0||lastTime>totalDuration+0.5)
     throw Error('原始影片結尾影格時間無法確認');
+  // 對影片與音訊都只讀小範圍來源位元組；不重新解碼整部影片。
+  // 影格順序、位元組與片尾必須一一對應；任何歧義都回退原本的嚴格驗證。
   let compared=0,windowStart=-1,windowBytes=null;
   const MAX_WINDOW=4*MB;
-  for(let i=0;i<count;i++){
-    if(i%64===0)checkStop();
-    const a=sv.samples[first+i],b=tv.samples[i];
-    if(a.size!==b.size||a.size<1)throw Error('來源與尾段視訊封包大小不符，第 '+(i+1)+' 筆');
-    if(b.ofs+b.size>tailData.byteLength)throw Error('尾段封包超出檔案範圍');
+  async function samePacket(a,b){
+    if(a.size!==b.size||a.size<1||b.ofs+b.size>tailData.byteLength)return false;
     if(!windowBytes||a.ofs<windowStart||a.ofs+a.size>windowStart+windowBytes.length){
-      // 對於跨窗口的單一大影格，擴展這一次窗口，避免忽略任何一個位元組。
       const size=Math.max(MAX_WINDOW,a.size);
       windowStart=a.ofs;
       windowBytes=new Uint8Array(await sourceFile.slice(a.ofs,Math.min(sourceFile.size,a.ofs+size)).arrayBuffer());
     }
     const pos=a.ofs-windowStart;
-    if(pos<0||pos+a.size>windowBytes.length)throw Error('來源影片封包讀取不完整');
-    for(let j=0;j<a.size;j++){
-      if(windowBytes[pos+j]!==tailData[b.ofs+j])
-        throw Error('第 '+(i+1)+' 個視訊封包內容與原片不一致');
+    if(pos<0||pos+a.size>windowBytes.length)return false;
+    for(let j=0;j<a.size;j++)if(windowBytes[pos+j]!==tailData[b.ofs+j])return false;
+    return true;
+  }
+  async function compareTrack(label,original,from,produced){
+    if(from<0||from+produced.length>original.length)throw Error(label+'封包序號超界');
+    for(let i=0;i<produced.length;i++){
+      if(i%64===0)checkStop();
+      if(!await samePacket(original[from+i],produced[i]))
+        throw Error(label+'第 '+(i+1)+' 個封包與原片不一致');
+      compared+=produced[i].size;
     }
-    compared+=a.size;
+  }
+  await compareTrack('視訊',sv.samples,first,tv.samples);
+  let audioCount=0;
+  if(sourceIndex.audio){
+    const sa=sourceIndex.audio,ta=tailIndex.audio;
+    audioCount=ta.samples.length;
+    if(audioCount<2||audioCount>sa.samples.length)throw Error('尾段音訊封包數不正常');
+    const aFirst=ta.samples[0],aLast=ta.samples[audioCount-1];
+    const aSpan=(aLast.dts+aLast.dur-aFirst.dts)/ta.scale;
+    if(!Number.isFinite(aSpan)||aSpan<plannedLength-0.65||aSpan>plannedLength+0.65)
+      throw Error('尾段音訊涵蓋時間不足或異常');
+    // 片尾 AAC 可能含少量編碼填補。只在最後 48 個來源音訊封包內尋找唯一
+    // 的連續區段；若有重複靜音封包或資料不符，絕不推測正確答案。
+    const maxStart=sa.samples.length-audioCount;
+    const minStart=Math.max(0,maxStart-48);
+    const candidates=[];
+    for(let at=minStart;at<=maxStart;at++){
+      if(!await samePacket(sa.samples[at],ta.samples[0]))continue;
+      if(!await samePacket(sa.samples[at+audioCount-1],aLast))continue;
+      if(audioCount>2&&!await samePacket(sa.samples[at+1],ta.samples[1]))continue;
+      candidates.push(at);
+    }
+    if(candidates.length!==1)throw Error('尾段音訊在原片末端無法唯一定位');
+    const audioStart=sa.samples[candidates[0]].dts/sa.scale;
+    const videoStart=sv.samples[first].dts/sv.scale;
+    if(!Number.isFinite(audioStart)||Math.abs(audioStart-videoStart)>1.5)
+      throw Error('來源影音起點時間差異過大');
+    await compareTrack('音訊',sa.samples,candidates[0],ta.samples);
   }
   checkStop();
-  log(`【尾段封包核對通過】來源已校準關鍵影格 ${start.toFixed(3)} 秒起，${count} 個連續視訊封包逐位元組相同，含原片最後一個影格；檢查 ${(compared/MB).toFixed(2)}MiB`);
-  return {count,bytes:compared};
+  log(`【尾段封包核對通過】來源已校準關鍵影格 ${start.toFixed(3)} 秒起，${count} 個視訊封包及 ${audioCount} 個音訊封包逐位元組相同，包含原片最後影格；檢查 ${(compared/MB).toFixed(2)}MiB`);
+  return {count,audioCount,bytes:compared};
 }
 // 批次獨立解碼：一個 FFmpeg 命令各取每支片段的首張影格。
 // 任何片段缺少「可解碼首幀／有效時長」，立即退回原本逐片驗證，不會略過檢查。
@@ -1540,7 +1575,7 @@ async function verifyFastIndexWithPackets(engine, source, index, planned, durati
 // 下一階段只處理這一份中間檔，全部郵件寄送成功後才會建立下一份。
 // V10.7 保留 V10.6 真正的三級尾段備援：所有指令、讀檔、容量、解碼、時間與首尾驗證錯誤皆可切換下一種方式。
 // 禁止任何尚未通過檢驗的中間檔進入第二階段或 Gmail 佇列。
-async function buildVerifiedTailWithFallback({engine,dir,source,sourceFile,verifiedKeys,output,start,length,duration,maxBytes,meter,lastLines}){
+async function buildVerifiedTailWithFallback({engine,dir,source,sourceFile,verifiedKeys,skipFastSegment=false,output,start,length,duration,maxBytes,meter,lastLines}){
   const failures=[];
   const outSeek=start.toFixed(3),span=length.toFixed(3);
   const base=['-hide_banner','-nostdin'];
@@ -1552,7 +1587,7 @@ async function buildVerifiedTailWithFallback({engine,dir,source,sourceFile,verif
   const preroll=Math.min(12,Math.max(0,start));
   const methods=[
     // 第一至七批已成功的關鍵影格前導法；先試末批，不成功即執行原三級備援。
-    ...(start>6.1?[{level:0,label:'前導關鍵影格快切',lossy:false,fastSegment:true,
+    ...(start>6.1&&!skipFastSegment?[{level:0,label:'前導關鍵影格快切',lossy:false,fastSegment:true,
       args:['-ss',(start-6).toFixed(3),'-i',source,'-t',(6+length).toFixed(3),
         '-map','0:V:0','-map','0:a?','-c','copy','-f','segment',
         '-reference_stream','v:0','-segment_times','6.000','-segment_time_delta','0.04',
@@ -1573,6 +1608,7 @@ async function buildVerifiedTailWithFallback({engine,dir,source,sourceFile,verif
     const method=methods[i];
     checkStop();
     if(method.fastSegment)log('【尾段加速候選】先沿用前七批的關鍵影格分段法，完整驗證後才採用');
+    else if(i===0&&skipFastSegment)log('【尾段跳過已知不適用快切】來源不支援標準 MP4 重封裝，直接啟動原安全備援');
     else log('【尾段備援 '+method.level+'/3】'+method.label+'；保留原三級安全備援');
     try{await engine.deleteFile(output)}catch(_){}
     try{
@@ -1808,7 +1844,8 @@ async function createIntermediate(plan) {
         // V10.8: 快切僅在完整驗證通過後使用；保留 V10.6 原三級備援。
         // 僅針對未寄送的末批重試，三層都失敗則不更新進度且禁止寄送。
         const repaired=await buildVerifiedTailWithFallback({
-          engine,dir,source,sourceFile:input,verifiedKeys:plan.keyIndex,output,start,length,duration,
+          engine,dir,source,sourceFile:input,verifiedKeys:plan.keyIndex,
+          skipFastSegment:!!plan.nativeUnsupported,output,start,length,duration,
           maxBytes:Math.min(hardMaxFor(plan),BATCH_THRESHOLD),meter,lastLines
         });
         bytes=repaired.bytes;
