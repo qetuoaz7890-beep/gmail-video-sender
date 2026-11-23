@@ -26,7 +26,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-23-v10.7-fast-tail-audit.1';
+const BUILD_TAG='2026-11-23-v10.8-fast-tail-batch.1';
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
 // Supports ordinary non-fragmented AVC/HEVC + AAC/ALAC MP4, 1 video and 0/1 audio track.
@@ -832,7 +832,7 @@ async function validateSegment(engine,path,expectedMaxSeconds){
 // V7: 尾段會碰到 MP4 edit list / Input -ss / segment 的時間軸差異。
 // 比對來源與最後中間檔在「同一絕對位置」的實際解碼像素，而非只相信 MP4 Duration。
 // 只產生 64x64 灰階原始畫面（4096 bytes）；無重編碼，也不寫入大畫面。
-// V10.7: 保留 v10.6 的精準首尾畫面驗證，但來源影片優先使用「近端輸入定位 +
+// V10.8: 保留 v10.6 的精準首尾畫面驗證，但來源影片優先使用「近端輸入定位 +
 // 短距離輸出定位」解碼；以兩個不同前導距離做雙點交叉確認。MP4 edit list 若令
 // 快速定位偏移、失敗或畫面不同，才退回 v10.6 原本由片首解碼的精準驗證。
 // 最終仍必須逐像素核對（重編碼備援則採原本嚴格的亮度誤差限制）。
@@ -867,6 +867,31 @@ async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration
     }
     return sum/a.byteLength<=12 && bad/a.byteLength<=0.055;
   };
+  // 快速驗證：同一次來源解碼取得尾段兩端畫面，減少大型 MP4 反覆建立解碼器。
+  // 以 8 秒與 4 秒兩個獨立前導視窗各驗證一次；任一異常則改用原本逐點方法。
+  const grabPair=async(at1,at2,tag,preroll)=>{
+    if(!(at2>at1+0.01))throw Error('雙點取樣位置無效');
+    const base=Math.max(0,at1-preroll),paths=[dir+'/audit_'+tag+'_a.raw',dir+'/audit_'+tag+'_b.raw'];
+    try{
+      checkStop();
+      const args=['-hide_banner','-nostdin','-loglevel','error',
+        ...(base>0.001?['-ss',base.toFixed(3)]:[]),'-i',source];
+      for(let i=0;i<2;i++){
+        const at=(i?at2:at1)-base;
+        args.push('-ss',at.toFixed(3),'-map','0:V:0','-frames:v','1','-an',
+          '-vf','scale=64:64,format=gray','-f','rawvideo','-y',paths[i]);
+      }
+      const rc=await engine.exec(args);
+      if(rc!==0)throw Error('來源雙點抽樣命令失敗（'+rc+'）');
+      const frames=[];
+      for(const path of paths){
+        const frame=await engine.readFile(path);
+        if(frame.byteLength!==4096)throw Error('來源雙點影格資料不完整');
+        frames.push(frame);
+      }
+      return frames;
+    }finally{for(const path of paths){try{await engine.deleteFile(path)}catch(_){}}}
+  };
   const fastMatch=async(at,actual,tag)=>{
     // 原片短於前導時直接讓原版檢查處理；不聲稱做過快速定位。
     if(at<9)return false;
@@ -884,9 +909,30 @@ async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration
       return false;
     }
   };
-  // 必須確認尾段真的從原片預定切點開始，不得回到上一批。
+  // 必須同時核對尾段首尾影格；雙點來源抽樣少開 FFmpeg，失敗仍保留舊版完整檢查。
   const actualStart=await grab(tail,firstTarget,'tail_start');
-  let startMatch=await fastMatch(start,actualStart,'source_start');
+  const actualEnd=await grab(tail,lateTarget,'tail_end');
+  const anchor=Math.min(totalDuration-0.05,start+lateTarget);
+  const deviations=[0,-0.04,-0.08,-0.12,-0.16,0.04,0.08,0.12,0.16];
+  const atDeviation=(d)=>Math.min(totalDuration-0.10,
+    Math.max(start+Math.min(0.02,length/4),anchor+d));
+  let paired=false;
+  if(start>=9&&anchor>start+0.05){
+    try{
+      const first=await grabPair(start,anchor,'pair8',8);
+      if(equal(first[0],actualStart)&&equal(first[1],actualEnd)){
+        const second=await grabPair(start,anchor,'pair4',4);
+        paired=equal(second[0],actualStart)&&equal(second[1],actualEnd)
+          &&equal(first[0],second[0])&&equal(first[1],second[1]);
+      }
+      if(paired)log('【尾段雙點合併加速通過】兩次獨立來源定位均與尾段首尾影格相同');
+    }catch(err){
+      const msg=errorMessage(err);
+      if(stopRequested||/memory access out of bounds|out of memory|RuntimeError|abort\(/i.test(msg))throw err;
+      log('【尾段合併抽樣不可用】'+msg+'；使用原本的雙點逐片驗證');
+    }
+  }
+  let startMatch=paired||await fastMatch(start,actualStart,'source_start');
   if(startMatch)log('【尾段快速雙取樣通過】開頭 '+start.toFixed(3)+' 秒，兩個近端定位一致');
   else{
     log('【尾段驗證備援】開頭快速比對未通過，改用原版精準解碼');
@@ -895,13 +941,8 @@ async function auditTailFrames(engine,dir,source,tail,start,length,totalDuration
   }
   if(!startMatch)throw Error('最後一批開頭不是原片預定關鍵影格，停止避免重複或缺幀');
   log('【尾段畫面核對】開頭：原片 '+start.toFixed(3)+' 秒，解碼畫面相同');
-  // AAC priming/edit list 允許最多 0.16 秒採樣差，但不允許接近 2 秒的錯位。
-  const actualEnd=await grab(tail,lateTarget,'tail_end');
-  const anchor=Math.min(totalDuration-0.05,start+lateTarget);
-  const deviations=[0,-0.04,-0.08,-0.12,-0.16,0.04,0.08,0.12,0.16];
-  const atDeviation=(d)=>Math.min(totalDuration-0.10,
-    Math.max(start+Math.min(0.02,length/4),anchor+d));
-  let matched=false,offset=0;
+  // AAC priming/edit list 最多允許 0.16 秒採樣偏差，不接受接近 2 秒的錯位。
+  let matched=paired,offset=0;
   // 先對所有容許時間差做快速比對。任何一組通過「雙近端定位 + 像素」才接受。
   for(const deviation of deviations){
     if(await fastMatch(atDeviation(deviation),actualEnd,'source_end')){
@@ -1435,6 +1476,12 @@ async function buildVerifiedTailWithFallback({engine,dir,source,output,start,len
     '-avoid_negative_ts','make_zero','-y',output];
   const preroll=Math.min(12,Math.max(0,start));
   const methods=[
+    // 第一至七批已成功的關鍵影格前導法；先試末批，不成功即執行原三級備援。
+    ...(start>6.1?[{level:0,label:'前導關鍵影格快切',lossy:false,fastSegment:true,
+      args:['-ss',(start-6).toFixed(3),'-i',source,'-t',(6+length).toFixed(3),
+        '-map','0:V:0','-map','0:a?','-c','copy','-f','segment',
+        '-reference_stream','v:0','-segment_times','6.000','-segment_time_delta','0.04',
+        '-reset_timestamps','1','-y',dir+'/tail_fast_%03d.mp4']}]:[]),
     {level:1,label:'直接封包複製',lossy:false,
       args:['-i',source,'-ss',outSeek,'-t',span,'-map','0:V:0','-map','0:a?',
         '-c','copy','-avoid_negative_ts','make_zero','-y',output]},
@@ -1450,11 +1497,20 @@ async function buildVerifiedTailWithFallback({engine,dir,source,output,start,len
   for(let i=0;i<methods.length;i++){
     const method=methods[i];
     checkStop();
-    log('【尾段備援 '+method.level+'/3】'+method.label+'，第 '+(i+1)+' 種切割指令');
+    if(method.fastSegment)log('【尾段加速候選】先沿用前七批的關鍵影格分段法，完整驗證後才採用');
+    else log('【尾段備援 '+method.level+'/3】'+method.label+'；保留原三級安全備援');
     try{await engine.deleteFile(output)}catch(_){}
     try{
       const rc=await meter('尾段：'+method.label,()=>engine.exec([...base,...method.args]),length);
       if(rc!==0)throw Error('FFmpeg 指令失敗（回傳 '+rc+'）：'+lastLines.slice(-4).join(' | '));
+      if(method.fastSegment){
+        const names=(await engine.listDir(dir)).filter(e=>!e.isDir).map(e=>e.name);
+        if(!names.includes('tail_fast_001.mp4'))throw Error('快速分段沒有在預期關鍵影格產生末段');
+        const candidate=await engine.readFile(dir+'/tail_fast_001.mp4');
+        if(candidate.byteLength<MIN_VIDEO_BYTES||candidate.byteLength>=maxBytes)
+          throw Error('快速末段容量不符合安全限制');
+        await engine.writeFile(output,candidate);
+      }
       const size=await meter('尾段：檢查產出檔案',async()=>{
         const data=await engine.readFile(output);
         if(data.byteLength<MIN_VIDEO_BYTES)throw Error('輸出空白或不完整');
@@ -1475,9 +1531,19 @@ async function buildVerifiedTailWithFallback({engine,dir,source,output,start,len
       failures.push(method.label+'：'+reason);
       if(stopRequested||/memory access out of bounds|out of memory|RuntimeError|abort\(/i.test(reason))throw e;
       try{await engine.deleteFile(output)}catch(_){}
+    }finally{
+      if(method.fastSegment){
+        try{
+          const leftovers=await engine.listDir(dir);
+          for(const entry of leftovers){
+            if(!entry.isDir&&/^tail_fast_\d+\.mp4$/.test(entry.name))
+              await engine.deleteFile(dir+'/'+entry.name);
+          }
+        }catch(_){}
+      }
     }
   }
-  throw Error('尾段四種指令（三級備援）均未通過，禁止寄送：'+failures.join('；'));
+  throw Error('尾段加速候選及原三級備援皆未通過，禁止寄送：'+failures.join('；'));
 }
 
 async function createIntermediate(plan) {
@@ -1651,7 +1717,7 @@ async function createIntermediate(plan) {
         ];
       }
       if(finalDirect){
-        // V10.7: 保留 V10.6 包含指令失敗、輸出不存在/過大、解碼失敗、時間或畫面不符。
+        // V10.8: 快切僅在完整驗證通過後使用；保留 V10.6 原三級備援。
         // 僅針對未寄送的末批重試，三層都失敗則不更新進度且禁止寄送。
         const repaired=await buildVerifiedTailWithFallback({
           engine,dir,source,output,start,length,duration,
