@@ -7,6 +7,7 @@
 <label class="testMode" for="dryRun"><input type="checkbox" id="dryRun"><span>強制兩階段測試模式（完全不寄 Gmail）</span></label>
 <div class="testHint">安全測試模式：單部 120MiB 以上影片皆可測試（含大於 1GB）；不呼叫 Gmail。一般檔案使用 75MiB 小批測試；大於 1GB 的標準 MP4 測試完整切點規劃、逐段製作、19MiB 小段與本機模擬。</div>
 <div class="testHint">正式模式：大於 1GB 先「分段規劃」（只保留切點，目標約 300MB／段；低記憶體手機採較小批），再依 1/N、2/N 製作當前中間影片、分割成 19MiB 內附件、寄送成功後釋放；過程不預先堆積所有中間檔案。</div>
+<div id="activityHint" class="muted" aria-live="polite">寄送時請保持此頁在前景；切換 App 後，尚未上傳的附件會保留，回來按「開始寄送」繼續。</div>
 <div id="budgetInfo" class="notice" aria-live="polite" style="margin-top:10px"></div>
 <div class="muted">每輪最多寄出約 990MB 附件；下一片若會超過就先暫停，等待手動繼續。以檔案大小計算，不含郵件編碼容量。</div>
 <button id="resumeBudget" class="warn" style="display:none">繼續寄送（下一輪990MB）</button>
@@ -30,7 +31,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-24-v10.13-990mb-manual-pause.1';
+const BUILD_TAG='2026-11-25-v10.14-foreground-auth-pack.1';
 $('buildInfo').textContent='載入版本：'+BUILD_TAG;
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
@@ -329,7 +330,93 @@ const FAST_MP4 = (() => {
   return {readIndex,readAuditIndex:file=>readIndex(file,{auditOnly:true}),cut,planCut};
 })();
 
-let tokenAcquiredAt=0;
+let tokenAcquiredAt=0,tokenExpiresAt=0;
+const AUTH_MARGIN_MS=120000;
+function authReady(){
+  if(!token||!tokenAcquiredAt)return false;
+  return Date.now()<(tokenExpiresAt?tokenExpiresAt-Math.min(AUTH_MARGIN_MS,(tokenExpiresAt-tokenAcquiredAt)/5):tokenAcquiredAt+AUTH_REFRESH_AFTER_MS);
+}
+function acceptToken(response){
+  token=response.access_token;tokenAcquiredAt=Date.now();
+  const seconds=Number(response.expires_in);
+  tokenExpiresAt=Number.isFinite(seconds)&&seconds>0?tokenAcquiredAt+seconds*1000:0;
+}
+let preSendPauseReason='',pageHiddenAt=0,wakeSentinel=null,wakeRequest=null,wakeGeneration=0;
+const packActivity=new Map();
+function preflightPause(message){
+  preSendPauseReason=message;
+  throw deliveryError(message,'paused');
+}
+function assertSendReady(){
+  if(stopRequested)preflightPause('已暫停；尚未上傳的附件與進度已保留');
+  if(document.visibilityState==='hidden')preflightPause('頁面已切至背景，已保留未寄附件；回到此頁後按「開始寄送」繼續');
+  if(!authReady())preflightPause('Gmail 授權即將到期或已失效；請重新連結 Gmail，再按「開始寄送」，進度已保留');
+}
+// Yield as a task, without creating a chain of zero-delay timers.
+async function yieldPackTask(){
+  if(globalThis.scheduler?.yield)return await globalThis.scheduler.yield();
+  if(typeof MessageChannel==='function')return await new Promise(resolve=>{
+    const channel=new MessageChannel();
+    channel.port1.onmessage=()=>{channel.port1.close();channel.port2.close();resolve();};
+    channel.port2.postMessage(0);
+  });
+  // Older browsers: each encoding slice is bounded; do not wait on a background timer.
+  await Promise.resolve();
+}
+async function packStep(item,phase,operation){
+  const started=Date.now();let timer;
+  packActivity.set(item.name,{phase,started});
+  log(`【封裝開始】${item.name}：${phase}；頁面=${document.visibilityState}`);
+  try{
+    const value=await Promise.race([Promise.resolve().then(operation),new Promise((_,reject)=>{
+      timer=setTimeout(()=>reject(deliveryError(`${item.name} ${phase}超過45秒；已保留附件，請回到前景後再開始寄送`,'paused')),45000);
+    })]);
+    // Timers themselves may be suspended by the OS; check wall time after resuming too.
+    if(Date.now()-started>=45000)throw deliveryError(`${item.name} ${phase}停頓超過45秒；已保留附件，請回到前景後再開始寄送`,'paused');
+    return value;
+  }finally{
+    clearTimeout(timer);packActivity.delete(item.name);
+    log(`【封裝階段】${item.name}：${phase}；${formatElapsed((Date.now()-started)/1000)}；頁面=${document.visibilityState}`);
+  }
+}
+async function updateWakeLock(){
+  const needed=running||batchRunning;
+  if(!needed||document.visibilityState==='hidden'){
+    wakeGeneration++;
+    const old=wakeSentinel;wakeSentinel=null;
+    if(old)try{await old.release();}catch(_){}
+    $('activityHint').textContent=needed?'頁面在背景；未上傳的附件會保留，回來後按「開始寄送」繼續。':'寄送時請保持此頁在前景；切換 App 後可回來繼續。';
+    return;
+  }
+  if(wakeSentinel&&!wakeSentinel.released||wakeRequest)return;
+  if(!navigator.wakeLock?.request){$('activityHint').textContent='此瀏覽器無法保持螢幕開啟，寄送時請保持此頁在前景。';return;}
+  const generation=++wakeGeneration;
+  const request=(async()=>{
+    try{
+      const lock=await navigator.wakeLock.request('screen');
+      if(generation!==wakeGeneration||!(running||batchRunning)||document.visibilityState==='hidden'){await lock.release();return;}
+      wakeSentinel=lock;
+      lock.addEventListener('release',()=>{if(wakeSentinel===lock){wakeSentinel=null;$('activityHint').textContent='螢幕保持已解除，寄送時請保持此頁在前景。';}});
+      $('activityHint').textContent='處理中：已保持螢幕開啟，請維持此頁在前景。';
+    }catch(_){$('activityHint').textContent='無法保持螢幕開啟，寄送時請維持此頁在前景。';}
+  })();
+  wakeRequest=request;
+  try{await request;}finally{if(wakeRequest===request)wakeRequest=null;}
+  // A hide/show transition can race a pending request. Reacquire once it has settled.
+  if(generation!==wakeGeneration&&(running||batchRunning)&&document.visibilityState!=='hidden')void updateWakeLock();
+}
+if(document.addEventListener){
+  document.addEventListener('visibilitychange',()=>{
+    if(document.visibilityState==='hidden'){
+      pageHiddenAt=Date.now();
+      if(running||batchRunning)log('【頁面背景】'+([...packActivity].map(([name,x])=>name+'：'+x.phase).join('；')||'正在處理工作')+'；尚未開始的上傳會暫停');
+    }else if(pageHiddenAt){
+      if(running||batchRunning||prepared)log('【回到前景】背景經過 '+formatElapsed((Date.now()-pageHiddenAt)/1000)+'；寄送前重新檢查授權');
+      pageHiddenAt=0;
+    }
+    void updateWakeLock();
+  });
+}
 // 標準 MP4 的 >1GB 任務先預先產生全部約 300MB 的可播放中間 Blob；無法快切的來源仍採保守分批模式。
 const IS_ANDROID=/Android/i.test(navigator.userAgent);
 // Android 一次只處理約 95MiB 中間區段，減少手機記憶體負擔。
@@ -444,7 +531,7 @@ async function resumeBudgetWindow(){
   if(items.some(x=>x.state==='uncertain')){status(unknownHint());return;}
   if(sendBudget.reserved>0){status('仍有尚未確認的寄送容量；請先查詢或確認寄送結果');return;}
   if(!batchPlan&&items.every(x=>x.state==='sent')){status('本任務已全部寄送完成');return;}
-  if(!token||Date.now()-tokenAcquiredAt>AUTH_REFRESH_AFTER_MS){status('請先連結 Gmail，再按「繼續寄送（下一輪990MB）」；容量與進度會保留');return;}
+  if(!authReady()){status('請先連結 Gmail，再按「繼續寄送（下一輪990MB）」；容量與進度會保留');return;}
   if(!$('recipient').checkValidity()||!$('recipient').value.trim()){status('請輸入正確收件信箱');return;}
   sendBudget={cycle:sendBudget.cycle+1,used:0,reserved:0,paused:false};stopRequested=false;
   saveCheckpoint();refresh();status(`已手動繼續：第 ${sendBudget.cycle} 輪開始，附件容量重新從 0 / 990MB 計算`);
@@ -538,7 +625,7 @@ $('login').onclick=()=>{
       callback:r=>{
         if(r.error){status('Gmail 授權失敗：'+r.error+(r.error_description?' / '+r.error_description:''));return;}
         if(!r.access_token){status('Google 沒有回傳授權憑證');return;}
-        token=r.access_token;tokenAcquiredAt=Date.now();$('authState').textContent='Gmail 已授權（此分頁有效）';status('Gmail 已連線');
+        acceptToken(r);$('authState').textContent='Gmail 已授權（此分頁有效）';status('Gmail 已連線');
       },
       error_callback:e=>status('Google 登入視窗錯誤：'+(e.type||'unknown')+'。請檢查 Chrome 彈出式視窗設定')
     });
@@ -546,7 +633,7 @@ $('login').onclick=()=>{
     tokenClient.requestAccessToken({prompt:'consent'});
   }catch(e){status('Gmail 登入無法啟動：'+(e?.message||String(e)));}
 };
-$('logout').onclick=()=>{if(token&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(token,()=>{});token='';tokenAcquiredAt=0;$('authState').textContent='尚未連線';status('已中斷 Gmail 連線')};
+$('logout').onclick=()=>{if(token&&window.google?.accounts?.oauth2)google.accounts.oauth2.revoke(token,()=>{});token='';tokenAcquiredAt=0;tokenExpiresAt=0;$('authState').textContent='尚未連線';status('已中斷 Gmail 連線')};
 // Keep small core/worker JavaScript in this tab. Restarting a worker must not
 // re-download 100KB of JS or issue uncached HEAD requests on every single batch.
 let cachedFFmpegCoreSource=null, cachedFFmpegWorkerSource=null, verifiedFFmpegWasmURL=null;
@@ -815,6 +902,7 @@ async function stabilizeLargeFile(file,{force=false}={}){
 let prepProgress = null, workMeter = null;
 function setBusy(value) {
   running = value;
+  void updateWakeLock();
   if(value)clockStart();else if(!batchRunning)clockPause();
   for (const id of ['files','prepare','send','retry','testCore','tailProbe']) $(id).disabled = value || batchRunning;
   $('stop').disabled = false;
@@ -2529,7 +2617,8 @@ function b64utf8(s){
   const pieces=[];for(let i=0;i<b.length;i+=16384)pieces.push(String.fromCharCode(...b.subarray(i,i+16384)));
   return btoa(pieces.join(''));
 }
-async function makeMimeMessage(item,index,{testOnly=false}={}){
+async function makeMimeMessage(item,index,{testOnly=false,guarded=false}={}){
+  if(guarded)assertSendReady();
   if(!item.validated||!item.blob||item.blob.size<MIN_VIDEO_BYTES||item.blob.size>MAX)
     throw Error('附件容量異常，禁止建立寄送郵件');
   const email=testOnly?'local-test@example.invalid':$('recipient').value.trim();
@@ -2541,12 +2630,15 @@ async function makeMimeMessage(item,index,{testOnly=false}={}){
   const header=`${identity}To: ${recipe?.recipient||email}\r\nSubject: =?UTF-8?B?${b64utf8(subject)}?=\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary="${boundary}"\r\n\r\n--${boundary}\r\nContent-Type: text/plain; charset=UTF-8\r\nContent-Transfer-Encoding: base64\r\n\r\n${b64utf8('影片附件：'+filename)}\r\n--${boundary}\r\nContent-Type: ${recipe?.type||item.blob.type||'application/octet-stream'}; name="attachment"\r\nContent-Disposition: attachment; filename="${filename}"\r\nContent-Transfer-Encoding: base64\r\n\r\n`;
   // Blob 可由多個小字串組成，不需先組成一份 26MiB 字串後再編碼成 35MiB 的 JSON raw。
   const parts=[header];
-  const buf=new Uint8Array(await item.blob.arrayBuffer());
+  const buf=new Uint8Array(await packStep(item,'讀取附件',()=>item.blob.arrayBuffer()));
+  if(guarded)assertSendReady();
   if(recipe){
-    const digest=Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256',buf)),x=>x.toString(16).padStart(2,'0')).join('');
+    const digest=Array.from(new Uint8Array(await packStep(item,'內容雜湊',()=>crypto.subtle.digest('SHA-256',buf))),x=>x.toString(16).padStart(2,'0')).join('');
     if(item.contentHash&&item.contentHash!==digest)throw Error('附件內容與原上傳不同，禁止接續');
     item.contentHash=digest;saveCheckpoint();
   }
+  if(guarded)assertSendReady();
+  const encodeStarted=Date.now();
   const chunkBytes=57*256;
   for(let i=0;i<buf.byteLength;i+=chunkBytes){
     const encoded=btoa(String.fromCharCode(...buf.subarray(i,Math.min(i+chunkBytes,buf.byteLength))));
@@ -2554,17 +2646,23 @@ async function makeMimeMessage(item,index,{testOnly=false}={}){
     if(!wrapped.endsWith('\r\n'))wrapped+='\r\n';
     parts.push(wrapped);
     // 讓 Android 主執行緒能更新 UI；避免兩封同時準備時長時間卡住。
-    if(i>0 && i%(chunkBytes*64)===0)await sleep(0);
+    if(i>0 && i%(chunkBytes*64)===0){
+      if(guarded)assertSendReady();
+      await yieldPackTask();
+      if(guarded)assertSendReady();
+    }
   }
+  log(`【封裝階段】${item.name}：MIME編碼；${formatElapsed((Date.now()-encodeStarted)/1000)}`);
   parts.push(`--${boundary}--\r\n`);
   return new Blob(parts,{type:'message/rfc822'});
 }
 // 僅作為特定確定性 4xx（伺服器明確拒絕媒體上傳）時的相容退路。
 // chunk 的結尾保留 0–2 個 bytes，避免 chunk 間 Base64URL 位元錯位。
-async function blobToBase64Url(blob){
+async function blobToBase64Url(blob,guarded=false){
   const output=[];let carry=new Uint8Array(0);
-  for(let offset=0;offset<blob.size;offset+=256*1024){
-    const chunk=new Uint8Array(await blob.slice(offset,Math.min(blob.size,offset+256*1024)).arrayBuffer());
+  for(let offset=0;offset<blob.size;offset+=1024*1024){
+    if(guarded)assertSendReady();
+    const chunk=new Uint8Array(await blob.slice(offset,Math.min(blob.size,offset+1024*1024)).arrayBuffer());
     let bytes=chunk;
     if(carry.byteLength){bytes=new Uint8Array(carry.byteLength+chunk.byteLength);bytes.set(carry);bytes.set(chunk,carry.byteLength)}
     const full=bytes.byteLength-bytes.byteLength%3;
@@ -2573,6 +2671,8 @@ async function blobToBase64Url(blob){
         .replace(/\+/g,'-').replace(/\//g,'_'));
     }
     carry=bytes.slice(full);
+    await yieldPackTask();
+    if(guarded)assertSendReady();
   }
   if(carry.byteLength)output.push(btoa(String.fromCharCode(...carry)).replace(/\+/g,'-').replace(/\//g,'_').replace(/=+$/,''));
   return output.join('');
@@ -2580,7 +2680,7 @@ async function blobToBase64Url(blob){
 // Gmail resumable transport. No mailbox-read scope and no blind POST retry.
 // Protocol: https://developers.google.com/workspace/gmail/api/guides/uploads
 const GMAIL_CHUNK_BYTES=4*MB, GMAIL_RECOVERY_LIMIT=3;
-let gmailJsonFallback='';
+let gmailJsonFallback='',gmailInitGate=Promise.resolve();
 function deliveryError(message,delivery='failed'){
   const e=new Error(message);e.delivery=delivery;return e;
 }
@@ -2602,7 +2702,7 @@ async function gmailRequest(phase,url,options,timeout=120000){
     // Keep the timeout active while consuming the response body too.
     const text=await response.text();
     log(`【Gmail 連線】${phase}；HTTP ${response.status}；${formatElapsed((performance.now()-started)/1000)}`);
-    if(response.status===401){token='';tokenAcquiredAt=0;$('authState').textContent='授權已失效，請重新連結 Gmail';}
+    if(response.status===401){token='';tokenAcquiredAt=0;tokenExpiresAt=0;$('authState').textContent='授權已失效，請重新連結 Gmail';}
     return {status:response.status,ok:response.ok,headers:response.headers,text};
   }catch(e){
     log(`【Gmail 連線】${phase}；${e.name||'Error'}；${formatElapsed((performance.now()-started)/1000)}；online=${navigator.onLine}；頁面=${document.visibilityState}`);
@@ -2683,13 +2783,18 @@ function freezeMailRecipe(item,index){
   saveCheckpoint();
 }
 async function sendJSONCompatible(item,mime){
-  const raw=await blobToBase64Url(mime);
+  assertSendReady();
+  const raw=await packStep(item,'相容格式編碼',()=>blobToBase64Url(mime,true));
+  assertSendReady();
+  const jsonStarted=Date.now(),body=JSON.stringify({raw});
+  log(`【封裝階段】${item.name}：JSON序列化；${formatElapsed((Date.now()-jsonStarted)/1000)}`);
+  assertSendReady();
   if(stopRequested)throw deliveryError('已暫停；此封尚未開始上傳','paused');
   let response;
   item.jsonAttempted=true;saveCheckpoint();
   try{
     response=await gmailRequest('相容上傳', 'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',{
-      method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body:JSON.stringify({raw})
+      method:'POST',headers:{Authorization:'Bearer '+token,'Content-Type':'application/json'},body
     },180000);
   }catch(e){throw deliveryError(e.message+'；此封結果不明，請核對已寄件匣','uncertain');}
   const result=completedUpload(response);
@@ -2699,6 +2804,17 @@ async function sendJSONCompatible(item,mime){
   item.jsonAttempted=false;saveCheckpoint();throw gmailHTTPError(response);
 }
 async function initiateUpload(item,mime){
+  // Serialize only initialization. Never share one session URL between two emails.
+  const previous=gmailInitGate;let release;
+  gmailInitGate=new Promise(resolve=>{release=resolve;});
+  await previous;
+  try{
+    assertSendReady();
+    if(gmailJsonFallback)return null;
+    return await initiateUploadUnlocked(item,mime);
+  }finally{release();}
+}
+async function initiateUploadUnlocked(item,mime){
   let response;
   try{
     response=await gmailRequest('建立續傳工作','https://www.googleapis.com/upload/gmail/v1/users/me/messages/send?uploadType=resumable',{
@@ -2706,7 +2822,7 @@ async function initiateUpload(item,mime){
     },30000);
   }catch(e){
     // The initiating POST contains no mail bytes; fallback cannot duplicate a sent email.
-    gmailJsonFallback='續傳工作無法建立';log('【相容模式】續傳工作尚未傳入郵件內容，改用原本 JSON 寄送');
+    gmailJsonFallback='續傳工作無法建立';log('【相容模式】續傳初始化失敗（網路或瀏覽器限制，尚未確認原因）；未傳入郵件內容，改用 JSON，本分頁後續附件沿用相容模式');
     return null;
   }
   if(!response.ok){
@@ -2725,6 +2841,7 @@ async function sendResumable(item,mime){
   let upload=item.upload;
   if(upload){
     if(upload.size!==mime.size)throw deliveryError('重建郵件大小與原上傳不同，已停止續傳',uploadFailureState(item));
+    assertSendReady();
     const checked=await recoverUpload(item);
     if(checked.result)return checked.result;
     upload=item.upload;
@@ -2732,6 +2849,7 @@ async function sendResumable(item,mime){
   if(!upload){item.transport='json';saveCheckpoint();return await sendJSONCompatible(item,mime);}
   let recoveries=0,stalls=0;
   while(upload.offset<mime.size){
+    assertSendReady();
     if(stopRequested)throw deliveryError('已暫停；已確認的上傳進度保留','paused');
     const start=upload.offset,end=Math.min(mime.size,start+GMAIL_CHUNK_BYTES);
     upload.attempted=true;upload.mayComplete=end===mime.size;saveCheckpoint();
@@ -2773,12 +2891,13 @@ async function sendResumable(item,mime){
 async function sendOne(item,index){
   if(sessionTestMode)throw deliveryError('測試模式安全阻擋：禁止呼叫 Gmail 寄送 API');
   if(item.jsonAttempted)throw deliveryError('前次相容上傳結果不明，請先人工確認','uncertain');
+  assertSendReady();
   const started=performance.now();
   freezeMailRecipe(item,index);
   let mime;
-  try{mime=await makeMimeMessage(item,index);}catch(e){throw deliveryError(e.message,uploadFailureState(item));}
+  try{mime=await makeMimeMessage(item,index,{guarded:true});}catch(e){if(e.delivery==='paused'){preSendPauseReason=e.message;throw e;}throw deliveryError(e.message,uploadFailureState(item));}
   log(`【Gmail 封裝】${item.name}：${(mime.size/MB).toFixed(2)}MiB；${formatElapsed((performance.now()-started)/1000)}`);
-  if(stopRequested)throw deliveryError('已暫停；尚未開始下一次上傳','paused');
+  assertSendReady();
   if(!item.upload&&(item.transport==='json'||gmailJsonFallback)){
     item.transport='json';saveCheckpoint();return await sendJSONCompatible(item,mime);
   }
@@ -2798,7 +2917,8 @@ function unknownHint(){
 function queuePauseHint(){
   if(items.some(x=>x.state==='uncertain'))return unknownHint();
   if(sendBudget.paused)return budgetHint();
-  if(!token)return 'Gmail 授權已失效；請重新連結 Gmail 後按「開始寄送」續傳，進度已保留';
+  if(!authReady())return 'Gmail 授權即將到期或已失效；請重新連結 Gmail 後按「開始寄送」續傳，進度已保留';
+  if(preSendPauseReason)return preSendPauseReason;
   return '本批尚未全部完成；可按「開始寄送」繼續，已確認成功的附件會跳過';
 }
 async function checkUncertainUploads(){
@@ -2806,7 +2926,7 @@ async function checkUncertainUploads(){
   if(sessionTestMode){status('本機測試不會查詢 Gmail');return;}
   const targets=items.filter(x=>x.state==='uncertain'&&x.upload);
   if(!targets.length){status('沒有可查詢的續傳工作；舊版或相容上傳的結果不明郵件，請人工核對 Gmail 已寄件匣');return;}
-  if(!token||Date.now()-tokenAcquiredAt>AUTH_REFRESH_AFTER_MS){status('請先連結 Gmail，再查詢上傳結果');return;}
+  if(!authReady()){status('請先連結 Gmail，再查詢上傳結果');return;}
   setBusy(true);clockStage('查詢 Gmail 上傳結果');refresh();
   try{
     for(const item of targets){
@@ -2824,6 +2944,7 @@ async function checkUncertainUploads(){
 let adaptiveSendConcurrency=2,stableSendCount=0;
 async function sendQueue(failedOnly=false){
   if(running)return;
+  preSendPauseReason='';
   setBusy(true);clockStage('Gmail 寄送');
   try{
     if(sessionTestMode)throw Error('測試模式不得真實寄送 Gmail，請按「開始模擬」');
@@ -2831,7 +2952,7 @@ async function sendQueue(failedOnly=false){
     if(items.some(x=>x.state==='uncertain'))throw Error(unknownHint());
     if(sendBudget.paused)throw Error(budgetHint());
     if(!token)throw Error('請先連結 Gmail');
-    if(!tokenAcquiredAt||Date.now()-tokenAcquiredAt>AUTH_REFRESH_AFTER_MS)throw Error('Gmail 授權已超過 50 分鐘，請先按「連結 Gmail」重新授權；目前的分割結果會保留，沒有重寄');
+    if(!authReady())throw Error('Gmail 授權即將到期或已失效，請先按「連結 Gmail」重新授權；目前的分割結果會保留，沒有重寄');
     if(!$('recipient').checkValidity()||!$('recipient').value.trim())throw Error('請輸入正確收件信箱');
     const targets=items.filter(x=>failedOnly?x.state==='failed':x.state==='ready'||x.state==='failed');
     if(!targets.length)throw Error('沒有可寄送附件');
@@ -2869,7 +2990,7 @@ async function sendQueue(failedOnly=false){
             haltReason=unknownHint();
             stopRequested=true;
           }else if(e.delivery==='paused'){
-            haltReason='已暫停，已確認的上傳進度保留';stopRequested=true;
+            preSendPauseReason=x.error;haltReason=x.error;stopRequested=true;
           }else if(e.delivery||!token||/Gmail HTTP (401|403|429|5\d\d)\b/.test(x.error)){
             adaptiveSendConcurrency=1;stableSendCount=0;
             haltReason=queuePauseHint()+'；'+x.error;
@@ -2919,7 +3040,7 @@ async function sendBatchQueue(){
   if(!prepared){status('請先按「影片分割」完成第一批實際分割');return;}
   if(!batchPlan.testMode){
   if(!token){status('請先連結 Gmail');return;}
-  if(!tokenAcquiredAt||Date.now()-tokenAcquiredAt>AUTH_REFRESH_AFTER_MS){status('Gmail 授權已超過 50 分鐘，請重新按「連結 Gmail」後再開始寄送；已完成進度保留');return;}
+  if(!authReady()){status('Gmail 授權即將到期或已失效，請重新按「連結 Gmail」後再開始寄送；已完成進度保留');return;}
   }
   if(items.some(x=>x.state==='uncertain')){status(unknownHint());return;}
   if(!batchPlan.testMode&&(!$('recipient').checkValidity()||!$('recipient').value.trim())){status('請輸入正確收件信箱');return;}
@@ -2968,7 +3089,7 @@ async function sendBatchQueue(){
          ? `【第二階段 ${plan.groupIndex+1}/${plan.groups.length} 開始分割】上一段已${plan.testMode?'模擬':'寄送'}完成，使用第一階段已建立的中間影片`
          : `【轉換下一個中間影片】上一批已全部${plan.testMode?'模擬驗證':'寄送'}成功；現在才開始第 ${plan.groupIndex+1} 份`);
        await prepareNextLargeGroup(plan);
-       if(!plan.testMode&&Date.now()-tokenAcquiredAt>AUTH_REFRESH_AFTER_MS)log('【授權提醒】本批分割已完成，但 Gmail 授權已超過 50 分鐘；寄送前必須重新連結 Gmail');
+       if(!plan.testMode&&!authReady())log('【授權提醒】本批分割已完成，但 Gmail 授權即將到期或已失效；寄送前必須重新連結 Gmail');
        if(!plan.pendingEnd||plan.pendingEnd<=plan.position)throw Error('下一份中間影片沒有有效進度，已停止');
     }
     if(plan.done){
