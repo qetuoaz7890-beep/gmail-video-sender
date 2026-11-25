@@ -1,7 +1,7 @@
 <!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大量發送小工具</title><style>
 :root{font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;color:#eaf0ff;background:#0b1220}*{box-sizing:border-box}body{margin:0;padding:14px}main{max-width:850px;margin:auto}h1{font-size:1.5rem;margin:8px 0}.muted{color:#b2c0d8;font-size:.91rem}.panel{background:#17243a;border:1px solid #344862;border-radius:15px;padding:16px;margin:13px 0}label{display:block;font-weight:650;margin:12px 0 6px}input{width:100%;padding:11px;background:#0d192d;color:#fff;border:1px solid #536683;border-radius:9px;font-size:16px}input[type=file]{padding:8px}button{border:0;border-radius:9px;padding:12px 14px;font-weight:700;background:#64b6ff;color:#071426;margin:6px 6px 6px 0;cursor:pointer}button.secondary{background:#344963;color:#fff}button.warn{background:#ffce74}button:disabled{opacity:.45;cursor:not-allowed}input[type=checkbox]{width:20px;height:20px;flex:0 0 auto;accent-color:#64b6ff}.testMode{display:flex;align-items:center;gap:10px;font-weight:600;margin:10px 0}.testMode span{flex:1}.testHint{line-height:1.6;font-size:.9rem;color:#c5d8e9}.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.stat{background:#0d192d;border-radius:10px;padding:12px}.stat b{display:block;font-size:1.2rem;margin-top:4px}progress{width:100%;height:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;font-size:12px;background:#091426;padding:12px;border-radius:9px}.notice{color:#ffdc95}small{color:#a9b9d3}@media(min-width:700px){.stats{grid-template-columns:repeat(4,1fr)}}
 </style></head><body><main><h1>📨 大量發送小工具</h1><div id="buildInfo" class="muted" aria-live="polite"></div>
-<section class="panel"><h2>① Gmail 設定</h2><button id="login">連結 Gmail</button><button class="secondary" id="logout">中斷連線</button><div id="authState" class="muted">尚未連線</div><label>收件人 Email</label><input id="recipient" type="email" placeholder="name@company.com"><label>主旨</label><input id="subject" value="影片附件"></section>
+<section class="panel"><h2>① Gmail 設定</h2><button id="login">連結 Gmail</button><button class="secondary" id="logout">中斷連線</button><div id="authState" class="muted">尚未連線</div><label>收件人電子郵件</label><input id="recipient" type="email" placeholder="name@company.com"><label>主旨</label><input id="subject" value="影片附件"></section>
 <section class="panel"><h2>② 選擇影片</h2><label>可一次多選影片</label><input id="files" type="file" accept="video/*" multiple><div class="stats"><div class="stat">影片數<b id="fileCount">0</b></div><div class="stat">待寄附件<b id="pending">0</b></div><div class="stat">累積已寄附件容量<b id="sent">0 MiB</b></div><div class="stat">成功／剩餘封數<b id="counts">0 / 0</b></div></div></section>
 <section class="panel"><h2>③ 分割寄送</h2>
 <label class="testMode" for="dryRun"><input type="checkbox" id="dryRun"><span>強制兩階段測試模式（完全不寄 Gmail）</span></label>
@@ -31,7 +31,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-25-v10.14-foreground-auth-pack.1';
+const BUILD_TAG='2026-11-25-v10.15-batch-recovery-zh.1';
 $('buildInfo').textContent='載入版本：'+BUILD_TAG;
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
@@ -366,7 +366,7 @@ async function yieldPackTask(){
 async function packStep(item,phase,operation){
   const started=Date.now();let timer;
   packActivity.set(item.name,{phase,started});
-  log(`【封裝開始】${item.name}：${phase}；頁面=${document.visibilityState}`);
+  log(`【封裝開始】${item.name}：${phase}；頁面=${pageStateText()}`);
   try{
     const value=await Promise.race([Promise.resolve().then(operation),new Promise((_,reject)=>{
       timer=setTimeout(()=>reject(deliveryError(`${item.name} ${phase}超過45秒；已保留附件，請回到前景後再開始寄送`,'paused')),45000);
@@ -376,7 +376,7 @@ async function packStep(item,phase,operation){
     return value;
   }finally{
     clearTimeout(timer);packActivity.delete(item.name);
-    log(`【封裝階段】${item.name}：${phase}；${formatElapsed((Date.now()-started)/1000)}；頁面=${document.visibilityState}`);
+    log(`【封裝階段】${item.name}：${phase}；${formatElapsed((Date.now()-started)/1000)}；頁面=${pageStateText()}`);
   }
 }
 async function updateWakeLock(){
@@ -578,9 +578,15 @@ function clockPause(){
 }
 function clockReset(){jobClock.totalMs=0;jobClock.activeSince=null;jobClock.everStarted=false;jobClock.stage='尚未開始';jobClock.stageSince=null;jobClock.stageMs=0;clockRender();}
 setInterval(clockRender,1000);
-function log(s){const t=new Date().toLocaleTimeString('zh-TW',{hour12:false});logs.push(`[${t}] ${s}`);$('log').textContent=logs.slice(-120).join('\n');$('log').scrollTop=$('log').scrollHeight}
-function status(s){$('status').textContent=s;log(s)}
-function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=(sessionTestMode?'模擬 ':'')+success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${x.simulated?'僅模擬完成（未寄信）':x.state}${x.error?' ('+x.error+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
+function log(s){s=displayErrorText(s);const t=new Date().toLocaleTimeString('zh-TW',{hour12:false});logs.push(`[${t}] ${s}`);$('log').textContent=logs.slice(-120).join('\n');$('log').scrollTop=$('log').scrollHeight}
+function status(s){s=displayErrorText(s);$('status').textContent=s;log(s)}
+const ITEM_STATE_TEXT=Object.freeze({ready:'待傳送',sending:'傳送中',sent:'已傳送',failed:'傳送失敗',uncertain:'傳送結果不明',paused:'已暫停',skipped:'已略過',simulated:'僅模擬完成（未寄信）'});
+function itemStateText(item){return item.simulated?ITEM_STATE_TEXT.simulated:(ITEM_STATE_TEXT[item.state]||'未辨識狀態（請核對）');}
+function pageStateText(){return document.visibilityState==='visible'?'前景':document.visibilityState==='hidden'?'背景':'未確認';}
+function networkStateText(){return navigator.onLine?'已連網':'已離線';}
+function requestErrorText(error){return ({TypeError:'網路請求錯誤',NetworkError:'網路連線錯誤',AbortError:'連線已中止',TimeoutError:'連線逾時'})[error?.name]||'連線錯誤';}
+function displayErrorText(value){return String(value||'').replace(/Failed to fetch|fetch failed/gi,'網路請求失敗').replace(/NetworkError/gi,'網路連線錯誤').replace(/Load failed/gi,'載入失敗').replace(/The operation was aborted\.?/gi,'操作已中止');}
+function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+displayErrorText(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=(sessionTestMode?'模擬 ':'')+success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${itemStateText(x)}${x.error?' ('+displayErrorText(x.error)+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
 const testVisible=$('dryRun').checked||sessionTestMode;
 $('testStats').style.display=testVisible?'block':'none';
 $('testStats').textContent=testVisible?(testOutcome||`測試統計：已完成 ${testGroupHistory.length} 個中間影片，模擬 ${simulatedCount} 個附件，實際 Gmail 寄件 0 封`):'';
@@ -830,6 +836,9 @@ function applyRecoveryToGroup(plan,newItems,batchStart){
   for(let i=0;i<newItems.length;i++){
     const a=newItems[i],b=saved[i];
     if(a.name!==b.name||a.size!==b.size)throw Error(`恢復時 ${a.name} 大小或名稱不一致，禁止跳過/重寄；請人工核對`);
+  }
+  for(let i=0;i<newItems.length;i++){
+    const a=newItems[i],b=saved[i];
     a.budgetCharge=b.budgetCharge?{...b.budgetCharge}:null;
     if(b.state!=='sent'){
       a.mailRecipe=b.mailRecipe||null;a.contentHash=b.contentHash||'';a.transport=b.transport||'';a.jsonAttempted=!!b.jsonAttempted;
@@ -842,7 +851,9 @@ function applyRecoveryToGroup(plan,newItems,batchStart){
     }else{a.state=b.state==='failed'?'failed':'ready';}
   }
   log(`【安全續傳】重建 ${newItems.length} 個附件；其中 ${newItems.filter(x=>x.state==='sent').length} 封已確認寄出，不會重寄`);
+  // Both fields belong to this single restored batch. A later batch has a new end.
   plan.restoreBatch=null;
+  plan.restoreExpectedEnd=null;
 }
 async function stabilizeLargeFile(file,{force=false}={}){
   if(!IS_ANDROID||file.size<=96*MB||inputCopies.has(file))return;
@@ -2362,6 +2373,8 @@ async function preparePrecutGroup(plan){
   if(!total||index>=total)throw Error('第一階段沒有可用的切點規劃');
   const expected=plan.groups[index];
   if(!expected||expected.size<MIN_VIDEO_BYTES)throw Error('中間影片規劃無效');
+  if(Number.isFinite(plan.restoreExpectedEnd)&&Math.abs(plan.restoreExpectedEnd-expected.end)>0.005)
+    throw Error('恢復的中間影片終點與已存紀錄不同，禁止自動寄送');
   await checkStoragePreflight(plan.file,{beforeGroup:true});
   status(`第二階段 ${index+1}/${total} 開始剪輯｜僅建立當前約 ${(expected.size/1e6).toFixed(0)}MB 中間影片`);
   log(`【第二階段 ${index+1}/${total}】建立當前中間影片並切成小於 19MiB 的附件`);
@@ -2421,12 +2434,12 @@ async function prepareNextLargeGroup(plan){
         if(Number.isFinite(plan.restoreExpectedEnd)&&Math.abs(plan.restoreExpectedEnd-group.end)>0.005)throw Error('恢復時本批切點與已存記錄不符，已停止');
         const newItems=parts.map((part,i)=>({...part,
           name:String(items.length+i+1).padStart(4,'0')+'.mp4',size:part.blob.size}));
-        plan.pendingEnd=group.end;plan.groupIndex++;
+        const batchStart=items.length;applyRecoveryToGroup(plan,newItems,batchStart);
+        plan.pendingEnd=group.end;plan.groupIndex++;plan.batchStart=batchStart;
         if(plan.testMode){
           testGroupHistory.push({index:plan.groupIndex,start:group.start,end:group.end,parts:newItems.length,bytes:group.blob.size});
           log(`【本機模擬準備】第 ${plan.groupIndex} 份：${newItems.length} 個有效附件，不呼叫 Gmail API`);
         }
-        const batchStart=items.length;applyRecoveryToGroup(plan,newItems,batchStart);plan.batchStart=batchStart;
         items.push(...newItems);prepared=true;refresh();saveCheckpoint();
         status(`第 ${plan.groupIndex} 份已完成快速分割：${newItems.length} 封。這批全部寄完才製作下一批`);
         return;
@@ -2450,13 +2463,13 @@ async function prepareNextLargeGroup(plan){
       size:part.blob.size
     }));
     // 先標記本批切割終點，再公開郵件佇列；只有全批 Gmail 成功，位置才正式前進。
+    const batchStart=items.length;applyRecoveryToGroup(plan,newItems,batchStart);
     plan.pendingEnd=group.end;
-    plan.groupIndex++;
+    plan.groupIndex++;plan.batchStart=batchStart;
     if(plan.testMode){
       testGroupHistory.push({index:plan.groupIndex,start:group.start,end:group.end,parts:newItems.length,bytes:group.size});
       log(`【測試分批驗證】完成第 ${plan.groupIndex} 份，${(group.size/MB).toFixed(2)}MiB、${newItems.length} 個有效附件；現在可以模擬送出，完全不連 Gmail`);
     }
-    const batchStart=items.length;applyRecoveryToGroup(plan,newItems,batchStart);plan.batchStart=batchStart;
     items.push(...newItems);
     prepared=true;
     refresh();saveCheckpoint();
@@ -2705,7 +2718,7 @@ async function gmailRequest(phase,url,options,timeout=120000){
     if(response.status===401){token='';tokenAcquiredAt=0;tokenExpiresAt=0;$('authState').textContent='授權已失效，請重新連結 Gmail';}
     return {status:response.status,ok:response.ok,headers:response.headers,text};
   }catch(e){
-    log(`【Gmail 連線】${phase}；${e.name||'Error'}；${formatElapsed((performance.now()-started)/1000)}；online=${navigator.onLine}；頁面=${document.visibilityState}`);
+    log(`【Gmail 連線】${phase}；${requestErrorText(e)}；${formatElapsed((performance.now()-started)/1000)}；網路=${networkStateText()}；頁面=${pageStateText()}`);
     // Do not log the session URI or access token. online=true is not a reachability test.
     throw deliveryError(`${phase}：${controller.signal.aborted?'連線逾時':(e.message||String(e))}`);
   }finally{clearTimeout(timer);}
@@ -2975,18 +2988,18 @@ async function sendQueue(failedOnly=false){
           markItemSent(x,result);
           stableSendCount++;
           if(adaptiveSendConcurrency===1&&stableSendCount>=5){adaptiveSendConcurrency=2;stableSendCount=0;log('【智慧寄送】已連續成功 5 封；下一輪恢復雙封並行');}
-          log(`寄送成功：${x.name} / ${formatElapsed((performance.now()-startTime)/1000)} / Gmail ID: ${x.gmailId}`);
+          log(`寄送成功：${x.name} / ${formatElapsed((performance.now()-startTime)/1000)} / Gmail 郵件編號：${x.gmailId}`);
           saveCheckpoint();
         }catch(e){
           x.error=e?.message||String(e);
           const ambiguous=e.delivery==='uncertain'||(!e.delivery&&/Failed to fetch|NetworkError|network|timeout|abort|Gmail HTTP (429|5\d\d)\b/i.test(x.error));
           x.state=e.delivery==='paused'?'ready':(ambiguous?'uncertain':'failed');
           if(!ambiguous)releaseSendBudget(x);
-          status('寄送異常：'+x.name+' — '+x.error);
+          status('寄送異常：'+x.name+' — '+displayErrorText(x.error));
           if(ambiguous){
             adaptiveSendConcurrency=1;stableSendCount=0;
             log('【智慧寄送降速】暫降單封；可先查詢同一筆上傳，無法確認才需人工核對');
-            log('【網路診斷】online='+navigator.onLine+'；可見狀態='+document.visibilityState+'；封裝後花費='+formatElapsed((performance.now()-startTime)/1000));
+            log('【網路診斷】網路='+networkStateText()+'；頁面='+pageStateText()+'；封裝後花費='+formatElapsed((performance.now()-startTime)/1000));
             haltReason=unknownHint();
             stopRequested=true;
           }else if(e.delivery==='paused'){
@@ -3005,7 +3018,7 @@ async function sendQueue(failedOnly=false){
     else if(sendBudget.paused)status(budgetHint());
     else if(haltReason)status(haltReason);
     else if(stopRequested)status('已暫停；已啟動的郵件已完成，未寄項目保留');
-    else status('本輪處理結束；已確認成功 '+items.filter(x=>x.state==='sent').length+' / '+items.length+' 段');
+    else status((batchPlan?'本批寄送結束；目前已建立的附件':'本輪處理結束；附件')+'已確認成功 '+items.filter(x=>x.state==='sent').length+' / '+items.length+' 段'+(batchPlan?'；整部影片仍由分批流程確認完成':''));
     if(!batchPlan && items.length && items.every(x=>x.state==='sent'))await cleanupStagedSources();
   }catch(e){status(e?.message||String(e))}
   finally{setBusy(false);refresh()}
@@ -3086,7 +3099,7 @@ async function sendBatchQueue(){
        if(!(plan.duration>0))throw Error('尚未取得原片完整時長');
        if(plan.position>=plan.duration-0.1){plan.done=true;break;}
        log(plan.firstStageComplete
-         ? `【第二階段 ${plan.groupIndex+1}/${plan.groups.length} 開始分割】上一段已${plan.testMode?'模擬':'寄送'}完成，使用第一階段已建立的中間影片`
+         ? `【第二階段 ${plan.groupIndex+1}/${plan.groups.length} 開始分割】上一段已${plan.testMode?'模擬':'寄送'}完成，依第一階段切點建立本批中間影片`
          : `【轉換下一個中間影片】上一批已全部${plan.testMode?'模擬驗證':'寄送'}成功；現在才開始第 ${plan.groupIndex+1} 份`);
        await prepareNextLargeGroup(plan);
        if(!plan.testMode&&!authReady())log('【授權提醒】本批分割已完成，但 Gmail 授權即將到期或已失效；寄送前必須重新連結 Gmail');
@@ -3176,7 +3189,13 @@ $('resumeSaved').onclick=async()=>{
   }catch(e){status('【安全恢復停止】'+errorMessage(e));batchPlan=null;items=[];prepared=false;}
   finally{setBusy(false);refresh();}
 };
-$('export').onclick=()=>{const content='大量發送小工具寄送紀錄\n版本：'+BUILD_TAG+'\n'+new Date().toLocaleString('zh-TW')+'\n本輪容量：'+JSON.stringify(sendBudget)+'\n'+logs.join('\n')+'\n\n'+items.map(x=>`${x.name}\t${x.simulated?'simulated':x.state}\t${x.gmailId||''}\t${x.error||''}`).join('\n');const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([content],{type:'text/plain;charset=utf-8'}));a.download='gmail-v448-log.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
+function buildExportLog(){
+  return '大量發送小工具寄送紀錄\n版本：'+BUILD_TAG+'\n'+new Date().toLocaleString('zh-TW')+
+    `\n本輪容量：第 ${sendBudget.cycle} 輪；已傳送 ${sendBudget.used} 位元組；傳送中預留 ${sendBudget.reserved} 位元組；${sendBudget.paused?'已暫停，等待手動繼續':'未觸發容量暫停'}`+
+    '\n'+logs.join('\n')+'\n\n附件名稱\t傳送狀態\tGmail 郵件編號\t說明\n'+
+    items.map(x=>`${x.name}\t${itemStateText(x)}\t${x.gmailId||''}\t${displayErrorText(x.error)}`).join('\n');
+}
+$('export').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([buildExportLog()],{type:'text/plain;charset=utf-8'}));a.download='gmail-v10.15-寄送紀錄.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
 try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
