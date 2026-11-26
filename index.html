@@ -3,13 +3,54 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>大量發送小工具 v10.17</title>
+<title>大量發送小工具 v10.19</title>
 <style>
 :root{font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;color:#eaf0ff;background:#0b1220;color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:16px}main{max-width:850px;margin:auto}h1{font-size:1.4rem;margin:8px 0}h2{font-size:1.1rem;margin:0 0 16px}h3{font-size:1rem;margin:8px 0}.muted,small{color:#b2c0d8;font-size:.88rem;line-height:1.6}.panel{background:#17243a;border:1px solid #344862;border-radius:15px;padding:18px;margin:14px 0}label{display:block;font-weight:600;margin:14px 0 6px}input,select{width:100%;min-width:0;padding:12px;background:#0d192d;color:#fff;border:1px solid #536683;border-radius:9px;font:inherit;font-size:16px}input[type=file]{padding:10px}input[type=checkbox]{width:20px;height:20px;flex:0 0 auto;accent-color:#64b6ff}button{border:0;border-radius:9px;min-height:46px;padding:12px 14px;font:inherit;font-weight:650;background:#64b6ff;color:#071426;cursor:pointer;overflow-wrap:anywhere}button.secondary{background:#344963;color:#fff}button.warn{background:#ffce74;color:#271a00}button.danger{background:#442d38;color:#ffcbce;border:1px solid #795261}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:not-allowed}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #91ceff;outline-offset:3px}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}.main-actions{margin-top:0}.checkline,.testMode{display:flex;align-items:center;gap:10px;font-size:.92rem;line-height:1.6;font-weight:500}.testMode span{flex:1}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:16px 0 6px}.stat{background:#0d192d;border-radius:10px;padding:13px;overflow-wrap:anywhere;font-size:.85rem;color:#b2c0d8}.stat b{display:block;font-size:1.25rem;margin-top:5px;color:#fff}progress{width:100%;height:14px;accent-color:#64b6ff}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;font-size:12px;background:#091426;padding:12px;border-radius:9px}.notice{color:#ffdc95;line-height:1.6;overflow-wrap:anywhere}.state-card{background:#0d192d;border-radius:12px;padding:14px;margin:14px 0}.state-card>div+div{margin-top:9px}#status{color:#edf4ff;font-weight:600}#elapsedPanel{font-size:.85rem}#budgetInfo{font-size:.9rem}.fold{border-top:1px solid #344862;margin-top:16px;padding-top:14px}.fold>summary{cursor:pointer;min-height:36px;font-weight:600;color:#d5e5ff;line-height:1.6;overflow-wrap:anywhere}.fold[open]>summary{margin-bottom:12px}.testHint{line-height:1.7;font-size:.88rem;color:#b2c0d8;margin:8px 0}#queueInfo{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}#recipientHint{min-height:1.5em;margin-top:8px}#contactEditorTitle{margin-top:8px}.badge{display:inline-block;padding:6px 10px;border-radius:8px;background:#493f25;color:#ffdf91;font-weight:650;margin-bottom:12px;font-size:.9rem}[hidden]{display:none!important}#resumeBudget,#resumeSaved{width:100%;margin-top:10px}.recover-box{border:1px solid #795f38;background:#29261f;border-radius:10px;padding:12px;margin-top:14px}.footer-note{margin:18px 0;text-align:center}.footer-note .fold{text-align:left}.single-action{width:100%;margin:12px 0}.version{color:#a8b9d3;font-size:.85rem;font-weight:400;white-space:nowrap}.header-note{margin:5px 0 18px}@media(min-width:700px){body{padding:24px}.stats{grid-template-columns:repeat(4,minmax(0,1fr))}.main-actions{grid-template-columns:repeat(4,minmax(0,1fr))}.contact-fields{display:grid;grid-template-columns:1fr 1.5fr;gap:12px}}@media(max-width:380px){body{padding:10px}.panel{padding:14px}button{padding:11px 8px;font-size:.92rem}}
+
+/* 每個時間值獨立一列；數字增長不改變欄位順序或行高。 */
+.work-card{padding:14px;margin:12px 0}.work-card>div+div{margin-top:0}
+.work-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px!important}
+.work-heading h3{font-size:.88rem;color:#b2c0d8;margin:0;font-weight:500}
+.job-state{font-size:.76rem;line-height:1.5;padding:3px 8px;border-radius:20px;background:#26384e;color:#c6d7ed;white-space:nowrap}
+.job-state[data-state=active]{background:#173e50;color:#9de7ed}
+.job-state[data-state=done]{background:#214639;color:#aeebcc}
+.work-row{display:grid;grid-template-columns:6.5rem minmax(0,1fr);gap:8px;align-items:center;min-height:34px}
+.work-label{font-size:.8rem;color:#aebed4;font-weight:400;line-height:1.5}
+.work-value{color:#edf4ff;text-align:right;font-size:.94rem;font-weight:600;line-height:1.5;min-width:0}
+.time-value,.numeric-value{font-variant-numeric:tabular-nums;font-feature-settings:'tnum';white-space:nowrap;letter-spacing:0}
+.total-time{color:#93d1ff;font-size:1.07rem}
+.phase-value{display:block;overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:.87rem;font-weight:600;min-height:1.5em;line-height:1.5}
+.phase-row{min-height:34px}
+#elapsedPanel{margin:0;border:0;font-size:inherit}
+.progress-area{margin-top:10px!important;padding-top:10px;border-top:1px solid #2b3d55}
+.progress-title{display:flex;justify-content:space-between;gap:10px;align-items:baseline;margin-bottom:5px}
+#workProgress{font-size:.79rem;line-height:1.45;color:#b2c0d8;min-height:1.45em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin-top:6px}
+.work-context{margin-top:8px!important;padding-top:6px;border-top:1px solid #2b3d55}
+.work-filename{font-size:.79rem;color:#c4d4e9;line-height:1.5;min-height:1.5em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;margin:0 0 4px}
+.budget-row{margin-top:8px!important;padding-top:8px;border-top:1px solid #2b3d55}
+#budgetInfo{font-size:inherit}#budgetState{font-size:.78rem;line-height:1.5;color:#ffdc95;min-height:1.5em;margin-top:1px}
+.work-notice{font-size:.85rem;line-height:1.6;border-left:3px solid #577c9e;padding:8px 10px;margin:10px 0;white-space:pre-line;overflow-wrap:anywhere}
+#activityHint{font-size:.76rem;line-height:1.5}
+#advancedTools{margin-top:12px;padding-top:10px}#advancedTools>.fold{margin-top:10px;padding-top:10px}
+.work-title{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:12px}#workTitle{margin:0}.main-actions{gap:8px;margin:0 0 10px}.main-actions button{min-height:44px;padding:10px 8px}
+@media(max-width:380px){.work-row{grid-template-columns:5.8rem minmax(0,1fr);gap:6px}.work-value{font-size:.88rem}.total-time{font-size:1rem}.work-card{padding:12px}.phase-value{font-size:.83rem}}
+
+/* 窄螢幕使用較大字體時，改為標籤和時間上下排列；時間本身始終一行。 */
+.work-card{container-type:inline-size}
+@container (max-width:calc(17em - 32px)){
+  .work-row{grid-template-columns:minmax(0,1fr);gap:2px;min-height:58px;padding:5px 0}
+  .work-label{font-size:.8rem;line-height:1.4}
+  .work-value{justify-self:end;max-width:100%;font-size:.9rem}
+  #elapsedPanel .total-time{font-size:.9rem}
+}
+.file-details-list{list-style:none;padding:0;margin:8px 0;display:grid;gap:8px}
+.file-detail{background:#0d192d;border-radius:8px;padding:10px 12px;min-width:0}
+.file-detail-name{display:block;color:#eaf0ff;overflow-wrap:anywhere;font-size:.86rem;line-height:1.6}
+.file-detail-size{display:block;color:#b2c0d8;font-size:.78rem;margin-top:3px;font-variant-numeric:tabular-nums}
 </style>
 </head>
 <body><main>
-<h1>📨 大量發送小工具 <span class="version">v10.17</span></h1>
+<h1>📨 大量發送小工具 <span class="version">v10.19</span></h1>
 <p class="muted header-note">選擇收件人與影片，即可分割寄送。</p>
 <section class="panel" aria-labelledby="mailTitle">
 <h2 id="mailTitle">① 寄送設定</h2>
@@ -40,21 +81,35 @@
 <small>封數依已產生的附件計算；尚未分割的影片不計入待寄數。</small>
 </section>
 <section class="panel" aria-labelledby="workTitle">
-<h2 id="workTitle">③ 分割與寄送</h2>
+<div class="work-title"><h2 id="workTitle">③ 分割與寄送</h2><span id="jobState" class="job-state">待開始</span></div>
 <div id="testBadge" class="badge" hidden>測試模式・不會寄信</div>
 <div class="actions main-actions"><button id="prepare" type="button">影片分割</button><button id="send" type="button">開始寄送</button><button class="warn" id="stop" type="button">暫停</button><button class="secondary" id="retry" type="button">重試</button></div>
-<div class="state-card">
-<div id="status" role="status">正在準備…</div>
+<div id="workCard" class="state-card work-card">
+<div id="elapsedPanel" aria-live="off">
+<div class="work-row phase-row"><span class="work-label">處理階段</span><span id="stageLabel" class="work-value phase-value">尚未開始</span></div>
+<div class="work-row"><span class="work-label">累積處理時間</span><span id="elapsedTotal" class="work-value time-value total-time">0秒</span></div>
+<div class="work-row"><span class="work-label">本階段時間</span><span id="elapsedStage" class="work-value time-value">0秒</span></div>
+</div>
+<div class="progress-area">
+<div class="progress-title"><span class="work-label">目前進度</span><span id="workPercent" class="work-value numeric-value">0%</span></div>
 <progress id="progress" max="100" value="0" aria-label="目前分割或附件寄送進度"></progress>
-<div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div>
-<div id="elapsedPanel" class="muted" aria-live="off">累積處理時間：0秒｜目前階段：尚未開始</div>
-<div id="budgetInfo" class="notice" aria-live="polite"></div>
+<div id="workProgress" aria-live="off">等待選擇影片</div>
+</div>
+<div id="workContext" class="work-context" hidden>
+<div class="work-row"><span id="workFileLabel" class="work-label">目前影片</span><span id="workFileIndex" class="work-value numeric-value">—</span></div>
+<div id="workFileName" class="work-filename"></div>
+<div id="workBatchRow" class="work-row" hidden><span class="work-label">目前批次</span><span id="workBatch" class="work-value numeric-value">—</span></div>
+</div>
+<div id="budgetInfo" class="budget-row" aria-live="polite"><div class="work-row"><span class="work-label">本輪已寄容量</span><span id="budgetValue" class="work-value numeric-value">0.00 / 990 MB</span></div><div id="budgetState"></div></div>
 <button id="resumeBudget" class="warn" type="button" style="display:none">繼續寄送（下一輪990MB）</button>
 </div>
+<div id="status" class="work-notice" role="status">正在準備影片工具…</div>
 <div id="activityHint" class="muted" aria-live="polite">寄送時請保持此頁在前景。</div>
 <div id="testStats" class="muted" aria-live="polite"></div>
 <div id="storageHint" class="muted" aria-live="polite"></div>
 <div id="savedWork" class="recover-box" hidden><div id="checkpointHint" class="muted" aria-live="polite"></div><button id="resumeSaved" class="secondary" type="button" disabled>恢復上次未完成工作</button></div>
+<details id="advancedTools" class="fold"><summary>進階工具</summary>
+<details id="fileDetails" class="fold"><summary>查看完整影片名稱</summary><ol id="fileDetailsList" class="file-details-list"></ol><p id="fileDetailsEmpty" class="muted">尚未選擇影片。</p></details>
 <details class="fold"><summary>更多操作</summary><div class="actions"><button id="clearSaved" class="danger" type="button">清除已存進度</button><button id="clearOrphans" class="secondary" type="button">清理舊暫存檔</button></div></details>
 <details id="testTools" class="fold"><summary>測試工具</summary>
 <label class="testMode" for="dryRun"><input type="checkbox" id="dryRun"><span>啟用測試模式（不寄信）</span></label>
@@ -66,6 +121,7 @@
 <p class="muted">更換程式後需要重新開始時，依舊紀錄填寫續傳起點。只填已確認寄出的進度；新任務留白。</p>
 <label for="resumeCount">先前已確認寄出的附件封數</label><input id="resumeCount" type="number" min="0" step="1" placeholder="例如 15">
 <label for="resumeSec">先前已確認完成的影片秒數</label><input id="resumeSec" type="number" min="0" step="0.001" placeholder="例如 694.968">
+</details>
 </details>
 </section>
 <section id="uncertainPanel" class="panel" hidden aria-labelledby="uncertainTitle">
@@ -83,7 +139,7 @@
 <button class="secondary single-action" id="export" type="button">匯出寄送紀錄</button>
 </section>
 <div class="footer-note"><details class="fold"><summary>版本與使用說明</summary>
-<div id="buildInfo" class="muted" aria-live="polite">版本：v10.17｜正在啟動；若此訊息一直不變，表示程式尚未成功啟動。</div>
+<div id="buildInfo" class="muted" aria-live="polite">版本：v10.19｜正在啟動；若此訊息一直不變，表示程式尚未成功啟動。</div>
 <p class="muted">每輪接近 990MB 時暫停，需手動繼續。容量依附件檔案計算，不含郵件編碼。</p>
 <p class="muted">正式模式：大於 1GB 先規劃約 300MB 的分段，再逐批製作、分割成 19MiB 內附件與寄送；手機依可用記憶體調整批次容量。≤1GB 沿用原有流程。</p>
 </details></div>
@@ -92,7 +148,7 @@
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-26-v10.17-recipients-ui.1';
+const BUILD_TAG='2026-11-27-v10.19-display-corrections.1';
 $('buildInfo').textContent='載入版本：'+BUILD_TAG;
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
@@ -542,11 +598,10 @@ function commitSendBudget(item){
 }
 function renderSendBudget(){
   const test=$('dryRun').checked||sessionTestMode;
-  $('budgetInfo').textContent=test?'990MB 暫停：本機測試不寄信，不計入容量。':
-    `本輪已寄：${(sendBudget.used/1000000).toFixed(2)} / 990MB（第 ${sendBudget.cycle} 輪）`+
-    (sendBudget.reserved?`（寄送中／待確認 ${(sendBudget.reserved/1000000).toFixed(2)}MB）`:'')+
-    (sendBudget.paused?'；已暫停，請手動繼續':'');
-  $('resumeBudget').style.display=!test&&sendBudget.paused?'inline-block':'none';
+  const complete=!batchPlan&&prepared&&items.length>0&&items.every(x=>x.state==='sent');
+  uiText('budgetValue',test?'不計入容量':`${(sendBudget.used/1000000).toFixed(2)} / 990 MB`);
+  uiText('budgetState',test?'測試模式，不會寄信':complete?'本次附件已全部確認寄出':sendBudget.paused?'已達本輪上限，請手動繼續':sendBudget.reserved?`第 ${sendBudget.cycle} 輪・待確認 ${(sendBudget.reserved/1000000).toFixed(2)} MB`:`第 ${sendBudget.cycle} 輪・接近上限時暫停`);
+  $('resumeBudget').style.display=!test&&sendBudget.paused&&!complete?'inline-block':'none';
   $('resumeBudget').disabled=running||batchRunning||test||!prepared||!sendBudget.paused||
     items.some(x=>x.state==='uncertain')||sendBudget.reserved>0||(!batchPlan&&items.every(x=>x.state==='sent'));
 }
@@ -609,12 +664,61 @@ function formatElapsed(rawSeconds){
 }
 // 與 FFmpeg、原生快切、Gmail 傳送相互獨立的「實際作業計時」；不依賴 workProgress 不會被狀態訊息蓋掉。
 const jobClock={totalMs:0,activeSince:null,everStarted:false,stage:'尚未開始',stageSince:null,stageMs:0};
+let uiFileIndex=0,uiFileSignature='';
+function uiText(id,value){const node=$(id),text=String(value);if(node.textContent!==text)node.textContent=text;}
+function shortStage(value){
+  const text=String(value||'尚未開始');
+  if(/規劃|切點/.test(text))return '規劃影片分段';
+  if(/Gmail 寄送/.test(text))return sessionTestMode?'模擬寄送':'寄送影片附件';
+  if(/本機模擬寄送/.test(text))return '模擬寄送';
+  if(/查詢.*上傳/.test(text))return '確認寄送結果';
+  if(/第二階段/.test(text))return '分割影片附件';
+  if(/尾段/.test(text))return '測試最後一批';
+  return text.replace(/^第一階段[：:]?/,'').replace(/影片準備／讀取/,'讀取影片');
+}
+function renderWorkContext(){
+  const files=Array.from($('files').files),file=batchPlan?.file||files[Math.min(uiFileIndex,Math.max(0,files.length-1))];
+  const sendingGroup=!batchPlan&&files.length>1&&/Gmail 寄送|本機模擬寄送/.test(jobClock.stage);
+  $('workContext').hidden=!file;
+  if(file){
+    const index=Math.max(0,files.indexOf(file));
+    uiText('workFileLabel',sendingGroup?'本次影片':'目前影片');
+    uiText('workFileIndex',sendingGroup?`${files.length} 部`:`${index+1} / ${Math.max(1,files.length)}`);
+    uiText('workFileName',sendingGroup?'已產生的附件依序寄送':file.name);
+    $('workFileName').title=sendingGroup?files.map(x=>x.name).join('、'):file.name;
+  }
+  const signature=JSON.stringify(files.map(f=>[f.name,f.size,f.lastModified]));
+  if(signature!==uiFileSignature){
+    uiFileSignature=signature;
+    $('fileDetailsList').replaceChildren(...files.map((f,i)=>{
+      const li=document.createElement('li'),name=document.createElement('span'),size=document.createElement('span');
+      li.className='file-detail';name.className='file-detail-name';size.className='file-detail-size';
+      name.textContent=`${i+1}. ${f.name}`;size.textContent=`${(f.size/MB).toFixed(2)} MiB`;
+      li.append(name,size);return li;
+    }));
+    $('fileDetailsEmpty').hidden=files.length>0;
+  }
+  $('workBatchRow').hidden=!batchPlan;
+  if(batchPlan){const n=batchPlan.groupIndex,total=batchPlan.groups?.length;uiText('workBatch',n>0?(total?`${n} / ${total}`:`第 ${n} 批`):'規劃中');}
+  const progress=$('progress');
+  uiText('workPercent',progress.hasAttribute('value')?`${Math.max(0,Math.min(100,Math.round(progress.value)))}%`:'處理中');
+}
+function setWorkProgress(step,detail=''){
+  uiText('workProgress',detail||step);$('workProgress').title=detail?`${step}：${detail}`:step;
+  renderWorkContext();
+}
 function clockRender(){
   const now=performance.now(),live=jobClock.activeSince!==null;
   const total=jobClock.totalMs+(live?now-jobClock.activeSince:0);
   const stage=jobClock.stageMs+(live&&jobClock.stageSince!==null?now-jobClock.stageSince:0);
-  const suffix=live?'處理中':(jobClock.everStarted?'已暫停／等待操作':'尚未開始');
-  $('elapsedPanel').textContent=`累積處理時間：${formatElapsed(total/1000)}｜目前階段：${jobClock.stage}（${formatElapsed(stage/1000)}）｜${suffix}`;
+  uiText('elapsedTotal',formatElapsed(total/1000));
+  uiText('elapsedStage',formatElapsed(stage/1000));
+  uiText('stageLabel',shortStage(jobClock.stage));$('stageLabel').title=jobClock.stage;
+  const complete=!live&&!batchPlan&&items.length>0&&items.every(x=>x.state==='sent');
+  const state=live?(stopRequested?'暫停中':'處理中'):items.some(x=>x.state==='uncertain')?'待確認':complete?(sessionTestMode?'模擬結束':'已完成'):sendBudget.paused?'容量暫停':items.some(x=>x.state==='failed')?'等待重試':stopRequested?'已暫停':prepared?'等待寄送':jobClock.everStarted?'等待操作':'待開始';
+  uiText('jobState',state);
+  $('jobState').dataset.state=live?'active':complete?'done':'idle';
+  renderWorkContext();
 }
 function clockStage(label){
   if(label!==jobClock.stage){
@@ -637,17 +741,25 @@ function clockPause(){
   }
   clockRender();
 }
-function clockReset(){jobClock.totalMs=0;jobClock.activeSince=null;jobClock.everStarted=false;jobClock.stage='尚未開始';jobClock.stageSince=null;jobClock.stageMs=0;clockRender();}
+function clockReset(){uiFileIndex=0;jobClock.totalMs=0;jobClock.activeSince=null;jobClock.everStarted=false;jobClock.stage='尚未開始';jobClock.stageSince=null;jobClock.stageMs=0;clockRender();}
 setInterval(clockRender,1000);
 function log(s){s=displayErrorText(s);const t=new Date().toLocaleTimeString('zh-TW',{hour12:false});logs.push(`[${t}] ${s}`);$('log').textContent=logs.slice(-120).join('\n');$('log').scrollTop=$('log').scrollHeight}
-function status(s){s=displayErrorText(s);$('status').textContent=s;log(s)}
+function status(s){
+  s=displayErrorText(s);log(s);
+  let visible=s;
+  if(/^步驟 [1-4]\/4/.test(s))visible='正在準備影片處理工具…';
+  else if(s==='FFmpeg 核心載入成功')visible='工具已就緒，請選擇影片。';
+  else if(/^智慧寄送：第 /.test(s))visible='正在寄送附件，請保持此頁在前景。';
+  else if(/^處理 \d+\/\d+：/.test(s))visible='正在處理選取的影片。';
+  uiText('status',visible.replace(/｜/g,'\n'));
+}
 const ITEM_STATE_TEXT=Object.freeze({ready:'待傳送',sending:'傳送中',sent:'已傳送',failed:'傳送失敗',uncertain:'傳送結果不明',paused:'已暫停',skipped:'已略過',simulated:'僅模擬完成（未寄信）'});
 function itemStateText(item){return item.simulated?ITEM_STATE_TEXT.simulated:(ITEM_STATE_TEXT[item.state]||'未辨識狀態（請核對）');}
 function pageStateText(){return document.visibilityState==='visible'?'前景':document.visibilityState==='hidden'?'背景':'未確認';}
 function networkStateText(){return navigator.onLine?'已連網':'已離線';}
 function requestErrorText(error){return ({TypeError:'網路請求錯誤',NetworkError:'網路連線錯誤',AbortError:'連線已中止',TimeoutError:'連線逾時'})[error?.name]||'連線錯誤';}
 function displayErrorText(value){return String(value||'').replace(/Failed to fetch|fetch failed/gi,'網路請求失敗').replace(/NetworkError/gi,'網路連線錯誤').replace(/Load failed/gi,'載入失敗').replace(/The operation was aborted\.?/gi,'操作已中止');}
-function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+displayErrorText(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=success+' 封';$('sentCountLabel').textContent=sessionTestMode?'模擬完成':'已寄出';$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${itemStateText(x)}${x.error?' ('+displayErrorText(x.error)+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
+function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+displayErrorText(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;if(/Gmail 寄送/.test(jobClock.stage))setWorkProgress('寄送影片附件',`已確認 ${success} / ${items.length} 個已建立附件`);$('counts').textContent=success+' 封';$('sentCountLabel').textContent=sessionTestMode?'模擬完成':'已寄出';$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${itemStateText(x)}${x.error?' ('+displayErrorText(x.error)+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
 const testVisible=$('dryRun').checked||sessionTestMode;
 $('testStats').style.display=testVisible?'block':'none';
 $('testStats').textContent=testVisible?(testOutcome||`測試統計：已完成 ${testGroupHistory.length} 個中間影片，模擬 ${simulatedCount} 個附件，實際 Gmail 寄件 0 封`):'';
@@ -661,8 +773,9 @@ $('unknownHint').textContent=unknown.length?unknownHint():'';
 for(const id of ['recipient','subject','login','logout'])$(id).disabled=running||batchRunning;
 $('send').textContent=testVisible?'開始模擬（不寄 Gmail）':'開始寄送';
 $('prepare').textContent=testVisible?'測試影片分割':'影片分割';
-updateCheckpointHint();renderSendBudget();updateRecipientControls();
+updateCheckpointHint();renderSendBudget();updateRecipientControls();renderWorkContext();
 $('testBadge').hidden=!testVisible;
+$('activityHint').hidden=!(running||batchRunning);
 $('stop').disabled=!(running||batchRunning);
 $('uncertainPanel').hidden=!unknown.length;
 const failed=items.filter(x=>x.state==='failed').length;
@@ -955,7 +1068,7 @@ async function stabilizeLargeFile(file,{force=false}={}){
       if(bytes.byteLength!==end-offset)throw fileReadError(file,Error('本機複製取得的資料不完整'));
       await writable.write(bytes);
       if(offset===0||end===file.size||Math.floor(end/(64*MB))!==Math.floor(offset/(64*MB))){
-        $('workProgress').textContent=`本機檔案穩定化｜${(100*end/file.size).toFixed(0)}%｜已複製 ${(end/MB).toFixed(0)} / ${(file.size/MB).toFixed(0)}MiB`;
+        setWorkProgress('準備本機影片',`已複製 ${(end/MB).toFixed(0)} / ${(file.size/MB).toFixed(0)} MiB`);
       }
       bytes=null;
       if((offset/step)%8===0)await sleep(0);
@@ -982,6 +1095,7 @@ async function stabilizeLargeFile(file,{force=false}={}){
 let prepProgress = null, workMeter = null;
 function setBusy(value) {
   running = value;
+  $('activityHint').hidden=!(value||batchRunning);
   void updateWakeLock();
   if(value)clockStart();else if(!batchRunning)clockPause();
   for (const id of ['files','prepare','send','retry','testCore','tailProbe']) $(id).disabled = value || batchRunning;
@@ -1010,13 +1124,14 @@ $('resetTest').onclick=()=>{
   items=[];prepared=false;prepProgress=null;batchPlan=null;stopRequested=false;sessionTestMode=false;
   simulatedCount=0;testGroupHistory=[];testOutcome='';sentBytes=0;
   $('dryRun').checked=false;$('files').value='';$('resumeCount').value='';$('resumeSec').value='';
-  $('workProgress').textContent='尚未開始分割';refresh();status('本次測試／佇列已清除，返回正式模式；不影響 Gmail 已寄出的郵件');
+  setWorkProgress('等待選擇影片');refresh();status('本次測試／佇列已清除，返回正式模式；不影響 Gmail 已寄出的郵件');
 };
 $('files').addEventListener('change', () => {
   if(batchRunning){status('分批寄送中，請勿更換影片');return;}
   void cleanupStagedSources();
   const epoch = ++selectionEpoch, files = Array.from($('files').files);
   inputCopies = new WeakMap(); items = []; prepared = false; prepProgress = null; batchPlan = null; stopRequested = false; sessionTestMode=false; simulatedCount=0; testGroupHistory=[]; testOutcome="";
+  uiFileIndex=0;setWorkProgress(files.length?'影片已選取，等待分割':'等待選擇影片');
   refresh(); status(`已選取 ${files.length} 部影片，正在檢查讀取…`);
   selectionReady = (async () => {
     let budget = 96 * MB, failures = 0;
@@ -1041,15 +1156,17 @@ $('files').addEventListener('change', () => {
   })().catch(error => log(errorMessage(error)));
 });
 function beginMeter(engine, title, duration = 0) {
+  clockStage(title);
   let percent = null, processed = 0, lastLog = 0, alive = true;
   const start = performance.now();
   const render = () => {
     if (!alive) return;
     const elapsed = (performance.now() - start) / 1000;
-    $('workProgress').textContent = `${title}｜${percent === null ? '處理中' : '約 ' + Math.floor(percent) + '%'}｜已用 ${formatElapsed(elapsed)}`;
+    setWorkProgress(title,percent===null?'正在處理目前步驟':`本步驟約完成 ${Math.floor(percent)}%`);
     if (percent !== null && prepProgress) {
       $('progress').value = (prepProgress.index + percent / 100) / prepProgress.total * 100;
     } else $('progress').removeAttribute('value');
+    renderWorkContext();
     if (elapsed - lastLog >= 15) {
       log(`${title}：已用 ${formatElapsed(elapsed)}${processed ? '，處理到 ' + processed.toFixed(1) + ' 秒' : ''}`);
       lastLog = elapsed;
@@ -2354,7 +2471,7 @@ async function prepareAllLargeNativeGroups(plan){
       totalVideo+=next.videoSamples;totalAudio+=next.audioSamples;
       log(`【第一階段規劃 ${groups.length}】預估 ${(next.size/1e6).toFixed(1)}MB，時間 ${next.start.toFixed(3)}～${next.end.toFixed(3)} 秒`);
       cursor=next.end;
-      $('workProgress').textContent=`影片檔案大於1GB開始分段剪輯（切點規劃）｜已規劃 ${groups.length} 段｜已用 ${formatElapsed((performance.now()-overallStart)/1000)}`;
+      setWorkProgress('規劃影片分段',`已規劃 ${groups.length} 段`);
       if(groups.length%2===0)await sleep(0);
     }
     if(Math.abs(cursor-idx.duration)>0.002 || totalVideo!==idx.video.samples.length || (idx.audio&&totalAudio!==expectedAudio))
@@ -2607,9 +2724,7 @@ async function prepare() {
       saveCheckpoint();
       await prepareNextLargeGroup(batchPlan);
       prepProgress.index=files.length;
-      $('workProgress').textContent=batchPlan.firstStageComplete
-        ? `第一階段已規劃 ${batchPlan.groups.length} 段｜第二階段 1/${batchPlan.groups.length} 已分割完成｜已用 ${formatElapsed((performance.now()-started)/1000)}`
-        : `第 1 份中間影片準備完成｜${items.filter(x=>x.state==='ready').length} 封｜已用 ${formatElapsed((performance.now()-started)/1000)}`;
+      setWorkProgress('本批分割完成',`已準備 ${items.filter(x=>x.state==='ready').length} 個附件，等待寄送`);
       status(sessionTestMode?'第一批 MP4 已完成驗證；按「開始模擬（不寄 Gmail）」繼續測試到整片結束'
         :batchPlan.firstStageComplete?`第一階段已規劃 ${batchPlan.groups.length} 段；第二階段 1/${batchPlan.groups.length} 分割完成，請按「開始寄送」`:
           '第一個中間影片已分割好，按「開始寄送」；寄完會自動處理下一個');
@@ -2619,6 +2734,7 @@ async function prepare() {
     log('【一般模式】影片未超過 1GB，沿用原本的完整分割流程');
     for (let i = 0; i < files.length; i++) {
       checkStop(); prepProgress.index = i;
+      uiFileIndex=i;renderWorkContext();
       const file = files[i]; await stabilizeLargeFile(file); checkStop(); const input = inputCopies.get(file) || file;
       status(`處理 ${i+1}/${files.length}：${file.name}`);
       let parts;
@@ -2642,11 +2758,11 @@ async function prepare() {
       }
       prepProgress.index = i+1; refresh();
     }
-    prepared = true; $('workProgress').textContent = `影片分割完成｜共用 ${formatElapsed((performance.now()-started)/1000)}`;
+    prepared = true; setWorkProgress('影片分割完成',`已準備 ${items.length} 個附件，等待寄送`);
     status(`準備完成：共 ${items.length} 個附件，請確認後開始寄送`);
   } catch (error) {
     // 分批失敗時保留上一個已確認寄送的進度；重新按影片分割可重試當前中間影片。
-    prepared = false; $('workProgress').textContent = `已停止｜共用 ${formatElapsed((performance.now()-started)/1000)}`;
+    prepared = false; setWorkProgress('目前工作已停止');
     status('準備未完成：'+errorMessage(error));
   } finally {
     if (workMeter) workMeter();
@@ -3095,6 +3211,7 @@ async function sendQueue(failedOnly=false){
 }
 async function simulateBatchQueue(){
   if(!sessionTestMode||!batchPlan?.testMode)throw Error('目前不是安全測試模式');
+  clockStage('本機模擬寄送');
   for(const x of items){
     if(stopRequested)break;
     if(x.state==='sent')continue;
@@ -3131,10 +3248,7 @@ async function sendBatchQueue(){
   if(!Number.isFinite(plan.position)||plan.position<0||!Number.isSafeInteger(plan.groupIndex)) {status('分批進度資料不合法，已安全停止，避免一次切整部影片');return;}
   // Lock selection for the entire batch operation, not only during sendQueue().
   batchRunning=true;stopRequested=false;plan.autoSending=true;setBusy(false);clockStart('Gmail 寄送');saveCheckpoint();
-  const sendingStarted=performance.now();
-  const sendingClock=plan.firstStageComplete?setInterval(()=>{
-    $('workProgress').textContent=`第二階段 ${plan.groupIndex}/${plan.groups.length}｜寄送處理中｜已用 ${formatElapsed((performance.now()-sendingStarted)/1000)}`;
-  },1000):null;
+  setWorkProgress('寄送影片附件','依序處理目前批次的附件');
   log(`【兩階段逐批流程】版本 ${BUILD_TAG}；原始 ${(plan.file.size/MB).toFixed(2)}MiB；已完成到 ${plan.position.toFixed(1)} 秒`);
   try{
     while(!stopRequested&&!plan.done){
@@ -3185,7 +3299,7 @@ async function sendBatchQueue(){
       await cleanupStagedSources();
     }else if(stopRequested){status('【分批已暫停】'+queuePauseHint());}
   }catch(e){status('【分批模式停止】'+errorMessage(e));}
-  finally{if(sendingClock)clearInterval(sendingClock);plan.autoSending=false;batchRunning=false;setBusy(false);refresh();}
+  finally{plan.autoSending=false;batchRunning=false;setBusy(false);refresh();}
 }
 $('send').onclick=sendBatchQueue;
 $('retry').onclick=async()=>{
@@ -3265,19 +3379,13 @@ function buildExportLog(){
     '\n'+logs.join('\n')+'\n\n附件名稱\t傳送狀態\tGmail 郵件編號\t說明\n'+
     items.map(x=>`${x.name}\t${itemStateText(x)}\t${x.gmailId||''}\t${displayErrorText(x.error)}`).join('\n');
 }
-$('export').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([buildExportLog()],{type:'text/plain;charset=utf-8'}));a.download='gmail-v10.17-寄送紀錄.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
+$('export').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([buildExportLog()],{type:'text/plain;charset=utf-8'}));a.download='gmail-v10.19-寄送紀錄.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
 // 常用收件人只改變輸入欄位，寄送與安全續傳仍沿用原有收件人檢查。
 const RECIPIENT_BOOK_KEY='bulk_sender_recipient_book_v1';
 const LEGACY_RECIPIENT_KEY='v44_recipient';
 const recipientValidator=document.createElement('input');
 recipientValidator.type='email';
 let recipientBook={version:1,rememberLast:true,lastRecipient:'',contacts:[]};
-function validRecipientEmail(value){
-  if(typeof value!=='string'||!value||value.length>254||/[\r\n\x00-\x1f\x7f]/.test(value))return false;
-  recipientValidator.value=value;
-  return recipientValidator.checkValidity()&&recipientValidator.value===value;
-}
-function recipientKey(value){return String(value||'').trim().toLowerCase();}
 let editingContactEmail='',recipientStorageProblem='';
 function recipientKey(value){return String(value||'').trim().toLowerCase();}
 function validRecipientEmail(value){
