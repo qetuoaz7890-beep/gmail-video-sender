@@ -1,37 +1,98 @@
-<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>大量發送小工具 v10.16</title><style>
-:root{font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;color:#eaf0ff;background:#0b1220}*{box-sizing:border-box}body{margin:0;padding:14px}main{max-width:850px;margin:auto}h1{font-size:1.5rem;margin:8px 0}.muted{color:#b2c0d8;font-size:.91rem}.panel{background:#17243a;border:1px solid #344862;border-radius:15px;padding:16px;margin:13px 0}label{display:block;font-weight:650;margin:12px 0 6px}input{width:100%;padding:11px;background:#0d192d;color:#fff;border:1px solid #536683;border-radius:9px;font-size:16px}input[type=file]{padding:8px}button{border:0;border-radius:9px;padding:12px 14px;font-weight:700;background:#64b6ff;color:#071426;margin:6px 6px 6px 0;cursor:pointer}button.secondary{background:#344963;color:#fff}button.warn{background:#ffce74}button:disabled{opacity:.45;cursor:not-allowed}input[type=checkbox]{width:20px;height:20px;flex:0 0 auto;accent-color:#64b6ff}.testMode{display:flex;align-items:center;gap:10px;font-weight:600;margin:10px 0}.testMode span{flex:1}.testHint{line-height:1.6;font-size:.9rem;color:#c5d8e9}.stats{display:grid;grid-template-columns:repeat(2,1fr);gap:9px}.stat{background:#0d192d;border-radius:10px;padding:12px}.stat b{display:block;font-size:1.2rem;margin-top:4px}progress{width:100%;height:16px}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;font-size:12px;background:#091426;padding:12px;border-radius:9px}.notice{color:#ffdc95}small{color:#a9b9d3}@media(min-width:700px){.stats{grid-template-columns:repeat(4,1fr)}}
-</style></head><body><main><h1>📨 大量發送小工具 v10.16</h1><div id="buildInfo" class="muted" aria-live="polite">版本：v10.16｜正在啟動；若此訊息一直不變，表示程式尚未成功啟動。</div>
-<section class="panel"><h2>① Gmail 設定</h2><button id="login">連結 Gmail</button><button class="secondary" id="logout">中斷連線</button><div id="authState" class="muted">尚未連線</div><label>收件人電子郵件</label><input id="recipient" type="email" placeholder="name@company.com"><label>主旨</label><input id="subject" value="影片附件"></section>
-<section class="panel"><h2>② 選擇影片</h2><label>可一次多選影片</label><input id="files" type="file" accept="video/*" multiple><div class="stats"><div class="stat">影片數<b id="fileCount">0</b></div><div class="stat">待寄附件<b id="pending">0</b></div><div class="stat">累積已寄附件容量<b id="sent">0 MiB</b></div><div class="stat">成功／剩餘封數<b id="counts">0 / 0</b></div></div></section>
-<section class="panel"><h2>③ 分割寄送</h2>
-<label class="testMode" for="dryRun"><input type="checkbox" id="dryRun"><span>強制兩階段測試模式（完全不寄 Gmail）</span></label>
-<div class="testHint">安全測試模式：單部 120MiB 以上影片皆可測試（含大於 1GB）；不呼叫 Gmail。一般檔案使用 75MiB 小批測試；大於 1GB 的標準 MP4 測試完整切點規劃、逐段製作、19MiB 小段與本機模擬。</div>
-<div class="testHint">正式模式：大於 1GB 先「分段規劃」（只保留切點，目標約 300MB／段；低記憶體手機採較小批），再依 1/N、2/N 製作當前中間影片、分割成 19MiB 內附件、寄送成功後釋放；過程不預先堆積所有中間檔案。</div>
-<div id="activityHint" class="muted" aria-live="polite">寄送時請保持此頁在前景；切換 App 後，尚未上傳的附件會保留，回來按「開始寄送」繼續。</div>
-<div id="budgetInfo" class="notice" aria-live="polite" style="margin-top:10px"></div>
-<div class="muted">每輪最多寄出約 990MB 附件；下一片若會超過就先暫停，等待手動繼續。以檔案大小計算，不含郵件編碼容量。</div>
-<button id="resumeBudget" class="warn" style="display:none">繼續寄送（下一輪990MB）</button>
-<div id="testStats" class="muted" aria-live="polite" style="margin-top:8px"></div>
-<div id="storageHint" class="muted" style="margin-top:8px" aria-live="polite"></div>
-<div id="checkpointHint" class="muted" aria-live="polite" style="margin-top:8px"></div>
-<button id="resumeSaved" class="secondary" disabled>恢復上次未完成工作</button><button id="clearSaved" class="warn">清除已存進度</button><button id="clearOrphans" class="secondary">清理舊暫存檔</button>
-<button class="secondary" id="resetTest">結束測試／返回正式模式</button>
-<button id="testCore" class="secondary">檢查 FFmpeg 核心</button><button id="tailProbe" class="secondary">只測最後一批（不寄信）</button><button id="prepare">影片分割</button><button id="send">開始寄送</button><button class="warn" id="stop">暫停</button><button class="secondary" id="retry">重試</button><progress id="progress" max="100" value="0"></progress><div id="elapsedPanel" class="muted" aria-live="off" style="margin:9px 0;padding:10px 12px;border-radius:9px;background:#0d192d;line-height:1.6">累積處理時間：0秒｜目前階段：尚未開始</div><div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div><div id="status" class="notice">正在自動檢查 FFmpeg 核心…</div></section>
-<section class="panel"><h2>④ 安全續傳與結果確認</h2>
-<div class="muted">如果影片已寄送一部分、但更換程式後需要重新開始，可依舊紀錄填寫續傳起點。請只填「全部已確認寄出」的最後一批，不要把寄送結果不明的附件算進去。</div>
-<label for="resumeCount">先前已確認寄出的附件封數（新任務留白）</label><input id="resumeCount" type="number" min="0" step="1" placeholder="例如 15">
-<label for="resumeSec">先前已確認完成的影片秒數（新任務留白）</label><input id="resumeSec" type="number" min="0" step="0.001" placeholder="例如 694.968">
-<div class="muted">有「結果不明」時，可先查詢同一筆上傳的結果。無法確認時，再到 Gmail 已寄件匣核對附件名稱、收件人與主旨，逐封標記。</div>
-<label for="uncertainSelect">寄送結果不明的附件</label><select id="uncertainSelect" style="width:100%;padding:10px;background:#0d192d;color:white;border:1px solid #536683;border-radius:9px"><option value="">目前沒有</option></select>
-<button id="checkUpload" class="secondary">查詢上傳結果</button><div id="unknownHint" class="notice" aria-live="polite"></div>
-<button id="confirmSent" class="secondary">確認已寄 → 標記成功</button><button id="confirmRetry" class="warn">確認未寄 → 允許重試</button>
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>大量發送小工具 v10.17</title>
+<style>
+:root{font-family:system-ui,-apple-system,'Noto Sans TC',sans-serif;color:#eaf0ff;background:#0b1220;color-scheme:dark}*{box-sizing:border-box}body{margin:0;padding:16px}main{max-width:850px;margin:auto}h1{font-size:1.4rem;margin:8px 0}h2{font-size:1.1rem;margin:0 0 16px}h3{font-size:1rem;margin:8px 0}.muted,small{color:#b2c0d8;font-size:.88rem;line-height:1.6}.panel{background:#17243a;border:1px solid #344862;border-radius:15px;padding:18px;margin:14px 0}label{display:block;font-weight:600;margin:14px 0 6px}input,select{width:100%;min-width:0;padding:12px;background:#0d192d;color:#fff;border:1px solid #536683;border-radius:9px;font:inherit;font-size:16px}input[type=file]{padding:10px}input[type=checkbox]{width:20px;height:20px;flex:0 0 auto;accent-color:#64b6ff}button{border:0;border-radius:9px;min-height:46px;padding:12px 14px;font:inherit;font-weight:650;background:#64b6ff;color:#071426;cursor:pointer;overflow-wrap:anywhere}button.secondary{background:#344963;color:#fff}button.warn{background:#ffce74;color:#271a00}button.danger{background:#442d38;color:#ffcbce;border:1px solid #795261}button:disabled,input:disabled,select:disabled{opacity:.5;cursor:not-allowed}button:focus-visible,input:focus-visible,select:focus-visible,summary:focus-visible{outline:3px solid #91ceff;outline-offset:3px}.actions{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:12px 0}.main-actions{margin-top:0}.checkline,.testMode{display:flex;align-items:center;gap:10px;font-size:.92rem;line-height:1.6;font-weight:500}.testMode span{flex:1}.stats{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin:16px 0 6px}.stat{background:#0d192d;border-radius:10px;padding:13px;overflow-wrap:anywhere;font-size:.85rem;color:#b2c0d8}.stat b{display:block;font-size:1.25rem;margin-top:5px;color:#fff}progress{width:100%;height:14px;accent-color:#64b6ff}pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto;font-size:12px;background:#091426;padding:12px;border-radius:9px}.notice{color:#ffdc95;line-height:1.6;overflow-wrap:anywhere}.state-card{background:#0d192d;border-radius:12px;padding:14px;margin:14px 0}.state-card>div+div{margin-top:9px}#status{color:#edf4ff;font-weight:600}#elapsedPanel{font-size:.85rem}#budgetInfo{font-size:.9rem}.fold{border-top:1px solid #344862;margin-top:16px;padding-top:14px}.fold>summary{cursor:pointer;min-height:36px;font-weight:600;color:#d5e5ff;line-height:1.6;overflow-wrap:anywhere}.fold[open]>summary{margin-bottom:12px}.testHint{line-height:1.7;font-size:.88rem;color:#b2c0d8;margin:8px 0}#queueInfo{white-space:pre-wrap;overflow-wrap:anywhere;max-height:300px;overflow:auto}#recipientHint{min-height:1.5em;margin-top:8px}#contactEditorTitle{margin-top:8px}.badge{display:inline-block;padding:6px 10px;border-radius:8px;background:#493f25;color:#ffdf91;font-weight:650;margin-bottom:12px;font-size:.9rem}[hidden]{display:none!important}#resumeBudget,#resumeSaved{width:100%;margin-top:10px}.recover-box{border:1px solid #795f38;background:#29261f;border-radius:10px;padding:12px;margin-top:14px}.footer-note{margin:18px 0;text-align:center}.footer-note .fold{text-align:left}.single-action{width:100%;margin:12px 0}.version{color:#a8b9d3;font-size:.85rem;font-weight:400;white-space:nowrap}.header-note{margin:5px 0 18px}@media(min-width:700px){body{padding:24px}.stats{grid-template-columns:repeat(4,minmax(0,1fr))}.main-actions{grid-template-columns:repeat(4,minmax(0,1fr))}.contact-fields{display:grid;grid-template-columns:1fr 1.5fr;gap:12px}}@media(max-width:380px){body{padding:10px}.panel{padding:14px}button{padding:11px 8px;font-size:.92rem}}
+</style>
+</head>
+<body><main>
+<h1>📨 大量發送小工具 <span class="version">v10.17</span></h1>
+<p class="muted header-note">選擇收件人與影片，即可分割寄送。</p>
+<section class="panel" aria-labelledby="mailTitle">
+<h2 id="mailTitle">① 寄送設定</h2>
+<div class="actions"><button id="login" type="button">連結 Gmail</button><button class="secondary" id="logout" type="button">中斷連線</button></div>
+<div id="authState" class="muted" aria-live="polite">尚未連線</div>
+<label for="recipientSelect">常用收件人</label>
+<select id="recipientSelect" aria-describedby="recipientHint"><option value="">手動輸入信箱</option></select>
+<label for="recipient">收件人電子郵件</label>
+<input id="recipient" type="email" placeholder="name@company.com" autocomplete="email" inputmode="email" autocapitalize="none" spellcheck="false">
+<label class="checkline" for="rememberRecipient"><input id="rememberRecipient" type="checkbox" checked><span>記住上次收件人</span></label>
+<div id="recipientHint" class="muted" role="status"></div>
+<details id="contactManager" class="fold">
+<summary>新增／管理常用收件人</summary>
+<div id="contactEditorTitle" class="muted">新增常用收件人</div>
+<div class="contact-fields">
+<div><label for="contactName">名稱（選填）</label><input id="contactName" maxlength="60" placeholder="例如：公司信箱" autocomplete="off"></div>
+<div><label for="contactEmail">電子郵件</label><input id="contactEmail" type="email" maxlength="254" placeholder="name@company.com" inputmode="email" autocomplete="off" autocapitalize="none" spellcheck="false"></div>
+</div>
+<div class="actions"><button id="saveContact" type="button">儲存收件人</button><button id="useCurrentContact" class="secondary" type="button">帶入目前信箱</button><button id="newContact" class="secondary" type="button">新增另一位</button><button id="deleteContact" class="danger" type="button" disabled>刪除此收件人</button></div>
+<small>從上方選單選取後可修改或刪除。名單儲存在這台裝置的此瀏覽器。</small>
+</details>
+<label for="subject">主旨</label><input id="subject" value="影片附件">
 </section>
-<section class="panel"><h2>⑤ 佇列與紀錄</h2><div id="queueInfo" class="muted">目前沒有佇列</div><pre id="log" aria-live="polite">等待操作…</pre><button class="secondary" id="export">匯出寄送紀錄</button></section></main>
+<section class="panel" aria-labelledby="videoTitle">
+<h2 id="videoTitle">② 選擇影片</h2>
+<label for="files">影片檔案（可多選）</label><input id="files" type="file" accept="video/*" multiple>
+<div class="stats"><div class="stat">影片數<b id="fileCount">0</b></div><div class="stat"><span id="sentCountLabel">已寄出</span><b id="counts">0 封</b></div><div class="stat">待寄送<b id="pending">0</b></div><div class="stat">累積已寄容量<b id="sent">0 MiB</b></div></div>
+<small>封數依已產生的附件計算；尚未分割的影片不計入待寄數。</small>
+</section>
+<section class="panel" aria-labelledby="workTitle">
+<h2 id="workTitle">③ 分割與寄送</h2>
+<div id="testBadge" class="badge" hidden>測試模式・不會寄信</div>
+<div class="actions main-actions"><button id="prepare" type="button">影片分割</button><button id="send" type="button">開始寄送</button><button class="warn" id="stop" type="button">暫停</button><button class="secondary" id="retry" type="button">重試</button></div>
+<div class="state-card">
+<div id="status" role="status">正在準備…</div>
+<progress id="progress" max="100" value="0" aria-label="目前分割或附件寄送進度"></progress>
+<div id="workProgress" class="muted" aria-live="polite">尚未開始分割</div>
+<div id="elapsedPanel" class="muted" aria-live="off">累積處理時間：0秒｜目前階段：尚未開始</div>
+<div id="budgetInfo" class="notice" aria-live="polite"></div>
+<button id="resumeBudget" class="warn" type="button" style="display:none">繼續寄送（下一輪990MB）</button>
+</div>
+<div id="activityHint" class="muted" aria-live="polite">寄送時請保持此頁在前景。</div>
+<div id="testStats" class="muted" aria-live="polite"></div>
+<div id="storageHint" class="muted" aria-live="polite"></div>
+<div id="savedWork" class="recover-box" hidden><div id="checkpointHint" class="muted" aria-live="polite"></div><button id="resumeSaved" class="secondary" type="button" disabled>恢復上次未完成工作</button></div>
+<details class="fold"><summary>更多操作</summary><div class="actions"><button id="clearSaved" class="danger" type="button">清除已存進度</button><button id="clearOrphans" class="secondary" type="button">清理舊暫存檔</button></div></details>
+<details id="testTools" class="fold"><summary>測試工具</summary>
+<label class="testMode" for="dryRun"><input type="checkbox" id="dryRun"><span>啟用測試模式（不寄信）</span></label>
+<div class="actions"><button id="testCore" class="secondary" type="button">檢查 FFmpeg 核心</button><button id="tailProbe" class="secondary" type="button">只測最後一批</button></div>
+<button class="secondary single-action" id="resetTest" type="button">結束測試／返回正式模式</button>
+<p class="testHint">測試模式適用於單部 120MiB 以上影片（含大於 1GB），只在本機模擬，不會寄信。「只測最後一批」也不會寄信。</p>
+</details>
+<details id="manualResume" class="fold"><summary>手動續傳設定</summary>
+<p class="muted">更換程式後需要重新開始時，依舊紀錄填寫續傳起點。只填已確認寄出的進度；新任務留白。</p>
+<label for="resumeCount">先前已確認寄出的附件封數</label><input id="resumeCount" type="number" min="0" step="1" placeholder="例如 15">
+<label for="resumeSec">先前已確認完成的影片秒數</label><input id="resumeSec" type="number" min="0" step="0.001" placeholder="例如 694.968">
+</details>
+</section>
+<section id="uncertainPanel" class="panel" hidden aria-labelledby="uncertainTitle">
+<h2 id="uncertainTitle">需要確認的寄送結果</h2>
+<p class="muted">先查詢上傳結果；仍無法確認時，請到 Gmail 已寄件匣核對附件名稱、收件人與主旨，再逐封標記。</p>
+<label for="uncertainSelect">結果不明的附件</label><select id="uncertainSelect"><option value="">目前沒有</option></select>
+<button id="checkUpload" class="secondary single-action" type="button">查詢上傳結果</button><div id="unknownHint" class="notice" aria-live="polite"></div>
+<div class="actions"><button id="confirmSent" class="secondary" type="button">確認已寄 → 標記成功</button><button id="confirmRetry" class="warn" type="button">確認未寄 → 允許重試</button></div>
+</section>
+<section class="panel" aria-labelledby="detailsTitle">
+<h2 id="detailsTitle">附件與紀錄</h2>
+<div id="queueSummary" class="muted" aria-live="polite">目前沒有附件</div>
+<details class="fold"><summary>查看附件清單</summary><div id="queueInfo" class="muted">目前沒有佇列</div></details>
+<details class="fold"><summary>詳細紀錄</summary><pre id="log">等待操作…</pre></details>
+<button class="secondary single-action" id="export" type="button">匯出寄送紀錄</button>
+</section>
+<div class="footer-note"><details class="fold"><summary>版本與使用說明</summary>
+<div id="buildInfo" class="muted" aria-live="polite">版本：v10.17｜正在啟動；若此訊息一直不變，表示程式尚未成功啟動。</div>
+<p class="muted">每輪接近 990MB 時暫停，需手動繼續。容量依附件檔案計算，不含郵件編碼。</p>
+<p class="muted">正式模式：大於 1GB 先規劃約 300MB 的分段，再逐批製作、分割成 19MiB 內附件與寄送；手機依可用記憶體調整批次容量。≤1GB 沿用原有流程。</p>
+</details></div>
+</main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id),MB=1024*1024,MAX=19*MB,MIN_VIDEO_BYTES=8192,BATCH_THRESHOLD=1024*MB,GMAIL_SCOPE='https://www.googleapis.com/auth/gmail.send';
 const GOOGLE_CLIENT_ID='612458875877-1ollgc131numte9m68512cotu26b2qri.apps.googleusercontent.com';
-const BUILD_TAG='2026-11-26-v10.16-startup-repair.1';
+const BUILD_TAG='2026-11-26-v10.17-recipients-ui.1';
 $('buildInfo').textContent='載入版本：'+BUILD_TAG;
 const AUTH_REFRESH_AFTER_MS=50*60*1000;
 // Native MP4 sample-table remux: no FFmpeg, no codec changes, bounded file ranges.
@@ -482,9 +543,9 @@ function commitSendBudget(item){
 function renderSendBudget(){
   const test=$('dryRun').checked||sessionTestMode;
   $('budgetInfo').textContent=test?'990MB 暫停：本機測試不寄信，不計入容量。':
-    `第 ${sendBudget.cycle} 輪附件：${(sendBudget.used/1000000).toFixed(2)} / 990MB`+
+    `本輪已寄：${(sendBudget.used/1000000).toFixed(2)} / 990MB（第 ${sendBudget.cycle} 輪）`+
     (sendBudget.reserved?`（寄送中／待確認 ${(sendBudget.reserved/1000000).toFixed(2)}MB）`:'')+
-    (sendBudget.paused?'；已暫停，等待手動繼續':'；下一片若會超過上限就先暫停');
+    (sendBudget.paused?'；已暫停，請手動繼續':'');
   $('resumeBudget').style.display=!test&&sendBudget.paused?'inline-block':'none';
   $('resumeBudget').disabled=running||batchRunning||test||!prepared||!sendBudget.paused||
     items.some(x=>x.state==='uncertain')||sendBudget.reserved>0||(!batchPlan&&items.every(x=>x.state==='sent'));
@@ -586,7 +647,7 @@ function pageStateText(){return document.visibilityState==='visible'?'前景':do
 function networkStateText(){return navigator.onLine?'已連網':'已離線';}
 function requestErrorText(error){return ({TypeError:'網路請求錯誤',NetworkError:'網路連線錯誤',AbortError:'連線已中止',TimeoutError:'連線逾時'})[error?.name]||'連線錯誤';}
 function displayErrorText(value){return String(value||'').replace(/Failed to fetch|fetch failed/gi,'網路請求失敗').replace(/NetworkError/gi,'網路連線錯誤').replace(/Load failed/gi,'載入失敗').replace(/The operation was aborted\.?/gi,'操作已中止');}
-function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+displayErrorText(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=(sessionTestMode?'模擬 ':'')+success+' / '+(items.length-success);$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${itemStateText(x)}${x.error?' ('+displayErrorText(x.error)+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
+function refresh(){const selected=$('uncertainSelect')?.value||'';const unknown=items.filter(x=>x.state==='uncertain');if($('uncertainSelect')){$('uncertainSelect').replaceChildren(...(unknown.length?unknown.map(x=>{const option=document.createElement('option');option.value=x.name;option.textContent=x.name+' — '+displayErrorText(x.error||'寄送狀態不明');return option;}):[(()=>{const option=document.createElement('option');option.value='';option.textContent='目前沒有';return option;})()]));if(unknown.some(x=>x.name===selected))$('uncertainSelect').value=selected;}$('confirmSent').disabled=$('confirmRetry').disabled=!unknown.length||running||batchRunning;const f=$('files').files;$('fileCount').textContent=f.length;$('pending').textContent=items.filter(x=>x.state==='ready'||x.state==='failed').length;$('sent').textContent=sessionTestMode?'0 MiB（模擬不寄信）':(sentBytes/MB).toFixed(1)+' MiB';const success=items.filter(x=>x.state==='sent').length;$('counts').textContent=success+' 封';$('sentCountLabel').textContent=sessionTestMode?'模擬完成':'已寄出';$('queueInfo').textContent=items.length?items.map((x,i)=>`${i+1}. ${x.name} — ${((x.blob?.size||x.size||0)/MB).toFixed(2)}MiB — ${itemStateText(x)}${x.error?' ('+displayErrorText(x.error)+')':''}`).join('\n'):'目前沒有佇列';$('queueInfo').style.whiteSpace='pre-wrap';$('progress').value=prepProgress?(prepProgress.index/prepProgress.total*100):(items.length?Math.round(success/items.length*100):0);
 const testVisible=$('dryRun').checked||sessionTestMode;
 $('testStats').style.display=testVisible?'block':'none';
 $('testStats').textContent=testVisible?(testOutcome||`測試統計：已完成 ${testGroupHistory.length} 個中間影片，模擬 ${simulatedCount} 個附件，實際 Gmail 寄件 0 封`):'';
@@ -600,7 +661,14 @@ $('unknownHint').textContent=unknown.length?unknownHint():'';
 for(const id of ['recipient','subject','login','logout'])$(id).disabled=running||batchRunning;
 $('send').textContent=testVisible?'開始模擬（不寄 Gmail）':'開始寄送';
 $('prepare').textContent=testVisible?'測試影片分割':'影片分割';
-updateCheckpointHint();renderSendBudget();
+updateCheckpointHint();renderSendBudget();updateRecipientControls();
+$('testBadge').hidden=!testVisible;
+$('stop').disabled=!(running||batchRunning);
+$('uncertainPanel').hidden=!unknown.length;
+const failed=items.filter(x=>x.state==='failed').length;
+const pending=items.filter(x=>x.state==='ready'||x.state==='paused').length;
+const sending=items.filter(x=>x.state==='sending').length;
+$('queueSummary').textContent=items.length?`已產生 ${items.length} 個附件・${testVisible?'模擬完成':'已寄出'} ${success}・待寄 ${pending}`+(sending?`・寄送中 ${sending}`:'')+(failed?`・失敗 ${failed}`:'')+(unknown.length?`・待確認 ${unknown.length}`:''):'目前沒有附件';
 }
 let gisReady=false,gisError='',gisLoading=null;
 function ensureGoogleLogin(){
@@ -792,6 +860,7 @@ function updateCheckpointHint(){
   $('checkpointHint').textContent=cp?`發現未完成進度：${cp.source.name}，已確認 ${cp.items.filter(x=>x.state==='sent').length} 封（${new Date(cp.savedAt).toLocaleString('zh-TW')}）。請重新選相同影片後按恢復，避免重寄。`:'目前沒有尚未完成的正式寄件進度';
   $('resumeSaved').disabled=running||batchRunning||!cp||!fileMatchesCheckpoint(selected,cp.source);
   $('clearSaved').disabled=running||batchRunning||!cp;
+  $('savedWork').hidden=!cp;
 }
 async function fingerprintFile(file){
   // Lightweight re-selection guard: same metadata and matching SHA-256 over
@@ -916,7 +985,8 @@ function setBusy(value) {
   void updateWakeLock();
   if(value)clockStart();else if(!batchRunning)clockPause();
   for (const id of ['files','prepare','send','retry','testCore','tailProbe']) $(id).disabled = value || batchRunning;
-  $('stop').disabled = false;
+  $('stop').disabled = !(value || batchRunning);
+  updateRecipientControls();
   $('dryRun').disabled = value || batchRunning || prepared || Boolean(batchPlan);
   $('resetTest').disabled = value || batchRunning;
 }
@@ -3195,8 +3265,159 @@ function buildExportLog(){
     '\n'+logs.join('\n')+'\n\n附件名稱\t傳送狀態\tGmail 郵件編號\t說明\n'+
     items.map(x=>`${x.name}\t${itemStateText(x)}\t${x.gmailId||''}\t${displayErrorText(x.error)}`).join('\n');
 }
-$('export').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([buildExportLog()],{type:'text/plain;charset=utf-8'}));a.download='gmail-v10.16-寄送紀錄.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
-try{$('recipient').value=localStorage.getItem('v44_recipient')||'';$('recipient').addEventListener('change',()=>{try{localStorage.setItem('v44_recipient',$('recipient').value)}catch(e){log('無法儲存收件人：'+e.message)}})}catch(e){log('瀏覽器儲存空間不可用：'+e.message)}refresh();
+$('export').onclick=()=>{const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([buildExportLog()],{type:'text/plain;charset=utf-8'}));a.download='gmail-v10.17-寄送紀錄.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),2000)};
+// 常用收件人只改變輸入欄位，寄送與安全續傳仍沿用原有收件人檢查。
+const RECIPIENT_BOOK_KEY='bulk_sender_recipient_book_v1';
+const LEGACY_RECIPIENT_KEY='v44_recipient';
+const recipientValidator=document.createElement('input');
+recipientValidator.type='email';
+let recipientBook={version:1,rememberLast:true,lastRecipient:'',contacts:[]};
+function validRecipientEmail(value){
+  if(typeof value!=='string'||!value||value.length>254||/[\r\n\x00-\x1f\x7f]/.test(value))return false;
+  recipientValidator.value=value;
+  return recipientValidator.checkValidity()&&recipientValidator.value===value;
+}
+function recipientKey(value){return String(value||'').trim().toLowerCase();}
+let editingContactEmail='',recipientStorageProblem='';
+function recipientKey(value){return String(value||'').trim().toLowerCase();}
+function validRecipientEmail(value){
+  if(typeof value!=='string'||value!==value.trim()||!value||value.length>254||/[\r\n\x00-\x1f\x7f]/.test(value))return false;
+  recipientValidator.value=value;
+  return recipientValidator.value===value&&recipientValidator.checkValidity();
+}
+function recipientMessage(message){
+  $('recipientHint').textContent=[message,recipientStorageProblem].filter(Boolean).join(' ');
+}
+function saveRecipientBook(){
+  try{
+    localStorage.setItem(RECIPIENT_BOOK_KEY,JSON.stringify(recipientBook));
+    // 成功寫入新版後才移除舊值，取消記住時不會於下次啟動復活。
+    localStorage.removeItem(LEGACY_RECIPIENT_KEY);
+    recipientStorageProblem='';
+    return true;
+  }catch(_){
+    recipientStorageProblem='瀏覽器無法儲存，這次變更只保留到關閉頁面。';
+    return false;
+  }
+}
+function rememberedRecipientChanged(){
+  const value=$('recipient').value.trim();
+  recipientBook.lastRecipient=recipientBook.rememberLast&&validRecipientEmail(value)?value:'';
+  saveRecipientBook();
+}
+function renderRecipientChoices(){
+  const dropdown=$('recipientSelect'),placeholder=document.createElement('option');
+  placeholder.value='';placeholder.textContent=recipientBook.contacts.length?'手動輸入信箱':'尚無常用收件人・可展開下方新增';
+  const options=recipientBook.contacts.map(contact=>{
+    const option=document.createElement('option');
+    option.value=recipientKey(contact.email);
+    option.textContent=contact.name?`${contact.name}（${contact.email}）`:contact.email;
+    return option;
+  });
+  dropdown.replaceChildren(placeholder,...options);
+  const current=recipientKey($('recipient').value);
+  dropdown.value=recipientBook.contacts.some(c=>recipientKey(c.email)===current)?current:'';
+}
+function resetContactEditor(contact=null){
+  editingContactEmail=contact?recipientKey(contact.email):'';
+  $('contactName').value=contact?.name||'';
+  $('contactEmail').value=contact?.email||'';
+  $('contactEditorTitle').textContent=contact?'修改常用收件人':'新增常用收件人';
+  $('saveContact').textContent=contact?'儲存修改':'儲存收件人';
+  updateRecipientControls();
+}
+function updateRecipientControls(){
+  const busy=running||batchRunning;
+  for(const id of ['recipient','subject','login','logout','recipientSelect','rememberRecipient','contactName','contactEmail','saveContact','useCurrentContact','newContact'])$(id).disabled=busy;
+  $('deleteContact').disabled=busy||!editingContactEmail;
+}
+function initializeRecipients(){
+  let migrate=false;
+  try{
+    const raw=localStorage.getItem(RECIPIENT_BOOK_KEY);
+    if(raw!==null){
+      const parsed=JSON.parse(raw);
+      if(parsed?.version!==1||typeof parsed.rememberLast!=='boolean'||!Array.isArray(parsed.contacts))throw Error('invalid recipient book');
+      const seen=new Set(),contacts=[];
+      for(const entry of parsed.contacts){
+        if(!entry||typeof entry.email!=='string')continue;
+        const email=entry.email.trim(),key=recipientKey(email);
+        if(!validRecipientEmail(email)||seen.has(key))continue;
+        seen.add(key);contacts.push({name:typeof entry.name==='string'?entry.name.trim().slice(0,60):'',email});
+      }
+      recipientBook={version:1,rememberLast:parsed.rememberLast,lastRecipient:parsed.rememberLast&&validRecipientEmail(parsed.lastRecipient)?parsed.lastRecipient:'',contacts};
+    }else{
+      const previous=localStorage.getItem(LEGACY_RECIPIENT_KEY)||'';
+      if(validRecipientEmail(previous.trim()))recipientBook.lastRecipient=previous.trim();
+      migrate=!!previous;
+    }
+  }catch(_){recipientStorageProblem='無法讀取已存名單，可先手動輸入信箱；重新儲存名單前請確認內容。';}
+  $('rememberRecipient').checked=recipientBook.rememberLast;
+  $('recipient').value=recipientBook.rememberLast?recipientBook.lastRecipient:'';
+  if(migrate)saveRecipientBook();
+  renderRecipientChoices();
+  resetContactEditor(recipientBook.contacts.find(c=>recipientKey(c.email)===$('recipientSelect').value)||null);
+  recipientMessage(recipientBook.lastRecipient?'已帶入上次收件人。':'');
+  $('recipientSelect').addEventListener('change',()=>{
+    if(running||batchRunning)return;
+    const contact=recipientBook.contacts.find(c=>recipientKey(c.email)===$('recipientSelect').value);
+    if(!contact){resetContactEditor();$('recipient').focus();return;}
+    $('recipient').value=contact.email;resetContactEditor(contact);rememberedRecipientChanged();
+    recipientMessage('已選擇：'+(contact.name||contact.email));
+  });
+  $('recipient').addEventListener('input',()=>{
+    if(running||batchRunning)return;
+    renderRecipientChoices();
+    // 手動改寄送信箱時，取消管理表單的舊編輯目標，避免誤刪。
+    if(editingContactEmail!==recipientKey($('recipient').value))resetContactEditor(recipientBook.contacts.find(c=>recipientKey(c.email)===recipientKey($('recipient').value))||null);
+  });
+  $('recipient').addEventListener('change',()=>{
+    if(running||batchRunning)return;
+    rememberedRecipientChanged();renderRecipientChoices();
+    recipientMessage(recipientBook.rememberLast?($('recipient').value.trim()&&!validRecipientEmail($('recipient').value.trim())?'信箱格式尚未完成，這次不會記住。':'已更新上次收件人。'):'本次收件人不會在下次開啟時自動帶入。');
+  });
+  $('rememberRecipient').addEventListener('change',()=>{
+    if(running||batchRunning)return;
+    recipientBook.rememberLast=$('rememberRecipient').checked;
+    rememberedRecipientChanged();
+    recipientMessage(recipientBook.rememberLast?'已啟用記住上次收件人。':'已取消記住；常用名單仍可從選單選取。');
+  });
+  $('useCurrentContact').addEventListener('click',()=>{
+    if(running||batchRunning)return;
+    const email=$('recipient').value.trim();
+    if(!validRecipientEmail(email)){recipientMessage('請先在收件人欄位輸入正確信箱。');$('recipient').focus();return;}
+    const contact=recipientBook.contacts.find(c=>recipientKey(c.email)===recipientKey(email));
+    resetContactEditor(contact||null);$('contactEmail').value=email;$('contactName').focus();
+  });
+  $('newContact').addEventListener('click',()=>{if(running||batchRunning)return;resetContactEditor();$('contactName').focus();});
+  $('saveContact').addEventListener('click',()=>{
+    if(running||batchRunning)return;
+    const email=$('contactEmail').value.trim(),name=$('contactName').value.trim().slice(0,60),key=recipientKey(email);
+    if(!validRecipientEmail(email)){recipientMessage('請輸入正確的常用收件人信箱。');$('contactEmail').reportValidity();$('contactEmail').focus();return;}
+    const conflict=recipientBook.contacts.find(c=>recipientKey(c.email)===key);
+    if(editingContactEmail&&key!==editingContactEmail&&conflict){recipientMessage('這個信箱已在名單中，請從上方選單選取該收件人後修改。');return;}
+    const index=recipientBook.contacts.findIndex(c=>recipientKey(c.email)===(editingContactEmail||key));
+    const contact={name,email};
+    if(index<0)recipientBook.contacts.push(contact);else recipientBook.contacts[index]=contact;
+    // 儲存名單不會擅自換掉本次收件人；同步目前正在編輯的同一個地址即可。
+    if(editingContactEmail&&recipientKey($('recipient').value)===editingContactEmail){
+      $('recipient').value=email;
+      recipientBook.lastRecipient=recipientBook.rememberLast?email:'';
+    }
+    const durable=saveRecipientBook();renderRecipientChoices();resetContactEditor(contact);
+    recipientMessage(durable?'已儲存，可從常用收件人選單選取。':'名單已暫時更新。');
+  });
+  $('deleteContact').addEventListener('click',()=>{
+    if(running||batchRunning||!editingContactEmail)return;
+    const contact=recipientBook.contacts.find(c=>recipientKey(c.email)===editingContactEmail);
+    if(!contact||!confirm(`從常用名單刪除「${contact.name||contact.email}」？本次收件人欄位會保留。`))return;
+    recipientBook.contacts=recipientBook.contacts.filter(c=>recipientKey(c.email)!==editingContactEmail);
+    const durable=saveRecipientBook();renderRecipientChoices();resetContactEditor();
+    recipientMessage(durable?'已從常用名單刪除，本次收件人不變。':'已從本次頁面的名單移除。');
+  });
+}
+
+initializeRecipients();refresh();
 // 網頁啟動後預先載入核心；與手動檢查共用 loadFFmpeg() 的單一載入 Promise。
 window.addEventListener('load',()=>{
   log(`程式版本：${BUILD_TAG}；先規劃後逐批製作／寄送／清理；大於 1GB 不預設複製整片；Gmail 可續傳上傳／結果核對；最多雙封並行；每輪990MB等待手動繼續；測試模式絕不寄信`);
